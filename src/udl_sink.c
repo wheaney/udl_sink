@@ -28,6 +28,12 @@ enum {
     UDL_MAX_COMMAND_PIXELS = 256u,
 };
 
+enum udl_stream_parse_result {
+    UDL_STREAM_PARSE_COMPLETE,
+    UDL_STREAM_PARSE_NEED_MORE,
+    UDL_STREAM_PARSE_INVALID,
+};
+
 enum udl_sink_plane {
     UDL_SINK_PLANE_8,
     UDL_SINK_PLANE_16,
@@ -54,6 +60,200 @@ static uint32_t udl_sink_read_addr24(const uint8_t *bytes)
 static uint32_t udl_sink_count_from_byte(uint8_t value)
 {
     return value == 0 ? UDL_MAX_COMMAND_PIXELS : (uint32_t)value;
+}
+
+static void udl_sink_merge_damage(struct udl_sink_damage *dst,
+                                  const struct udl_sink_damage *src)
+{
+    if (!dst || !src || !src->touched) {
+        return;
+    }
+
+    if (!dst->touched) {
+        *dst = *src;
+        return;
+    }
+
+    if (src->x1 < dst->x1) {
+        dst->x1 = src->x1;
+    }
+    if (src->y1 < dst->y1) {
+        dst->y1 = src->y1;
+    }
+    if (src->x2 > dst->x2) {
+        dst->x2 = src->x2;
+    }
+    if (src->y2 > dst->y2) {
+        dst->y2 = src->y2;
+    }
+    dst->pixel_count += src->pixel_count;
+}
+
+static enum udl_stream_parse_result udl_transport_parse_writerlx_length(const uint8_t *command,
+                                                                        size_t length,
+                                                                        size_t bytes_per_pixel,
+                                                                        size_t *command_len_out)
+{
+    uint32_t produced = 0u;
+    const uint32_t total_pixels = udl_sink_count_from_byte(command[5]);
+    size_t offset = 6u;
+
+    if (length < 7u) {
+        return UDL_STREAM_PARSE_NEED_MORE;
+    }
+
+    while (produced < total_pixels) {
+        uint32_t raw_count;
+        size_t raw_bytes;
+        uint32_t repeat_count;
+
+        if (offset >= length) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        raw_count = udl_sink_count_from_byte(command[offset]);
+        offset += 1u;
+        if (raw_count > total_pixels - produced) {
+            return UDL_STREAM_PARSE_INVALID;
+        }
+
+        raw_bytes = (size_t)raw_count * bytes_per_pixel;
+        if (length - offset < raw_bytes) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        offset += raw_bytes;
+        produced += raw_count;
+        if (produced == total_pixels) {
+            break;
+        }
+
+        if (offset >= length) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        repeat_count = command[offset];
+        offset += 1u;
+        if (repeat_count == 0u || repeat_count > total_pixels - produced) {
+            return UDL_STREAM_PARSE_INVALID;
+        }
+
+        produced += repeat_count;
+    }
+
+    *command_len_out = offset;
+    return UDL_STREAM_PARSE_COMPLETE;
+}
+
+static enum udl_stream_parse_result udl_transport_next_command_length(const uint8_t *command,
+                                                                      size_t length,
+                                                                      size_t *command_len_out)
+{
+    uint32_t pixel_count;
+    size_t command_len;
+
+    if (length < 2u) {
+        return UDL_STREAM_PARSE_NEED_MORE;
+    }
+    if (command[0] != UDL_MSG_BULK) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+
+    switch (command[1]) {
+    case UDL_CMD_WRITEREG:
+        if (length < 4u) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+        *command_len_out = 4u;
+        return UDL_STREAM_PARSE_COMPLETE;
+    case UDL_CMD_WRITERAW8:
+        if (length < 6u) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+        pixel_count = udl_sink_count_from_byte(command[5]);
+        command_len = 6u + (size_t)pixel_count;
+        break;
+    case UDL_CMD_WRITERL8:
+        command_len = 7u;
+        break;
+    case UDL_CMD_WRITECOPY8:
+        command_len = 9u;
+        break;
+    case UDL_CMD_WRITERLX8:
+        return udl_transport_parse_writerlx_length(command, length, 1u, command_len_out);
+    case UDL_CMD_WRITERAW16:
+        if (length < 6u) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+        pixel_count = udl_sink_count_from_byte(command[5]);
+        command_len = 6u + ((size_t)pixel_count * 2u);
+        break;
+    case UDL_CMD_WRITERL16:
+        command_len = 8u;
+        break;
+    case UDL_CMD_WRITECOPY16:
+        command_len = 9u;
+        break;
+    case UDL_CMD_WRITERLX16:
+        return udl_transport_parse_writerlx_length(command, length, 2u, command_len_out);
+    default:
+        return UDL_STREAM_PARSE_INVALID;
+    }
+
+    if (length < command_len) {
+        return UDL_STREAM_PARSE_NEED_MORE;
+    }
+
+    *command_len_out = command_len;
+    return UDL_STREAM_PARSE_COMPLETE;
+}
+
+static enum udl_transport_result udl_transport_reserve_pending(struct udl_transport *transport,
+                                                               size_t additional)
+{
+    size_t needed;
+    size_t new_capacity;
+    uint8_t *new_pending;
+
+    if (SIZE_MAX - transport->pending_len < additional) {
+        return UDL_TRANSPORT_ERR_NO_MEMORY;
+    }
+
+    needed = transport->pending_len + additional;
+    if (needed <= transport->pending_capacity) {
+        return UDL_TRANSPORT_OK;
+    }
+
+    new_capacity = transport->pending_capacity ? transport->pending_capacity : 65536u;
+    while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2u) {
+            new_capacity = needed;
+            break;
+        }
+        new_capacity *= 2u;
+    }
+
+    new_pending = realloc(transport->pending, new_capacity);
+    if (!new_pending) {
+        return UDL_TRANSPORT_ERR_NO_MEMORY;
+    }
+
+    transport->pending = new_pending;
+    transport->pending_capacity = new_capacity;
+    return UDL_TRANSPORT_OK;
+}
+
+static void udl_transport_consume(struct udl_transport *transport, size_t count)
+{
+    if (count >= transport->pending_len) {
+        transport->pending_len = 0u;
+        return;
+    }
+
+    memmove(transport->pending,
+            transport->pending + count,
+            transport->pending_len - count);
+    transport->pending_len -= count;
 }
 
 static uint32_t udl_sink_plane_bytes_per_pixel(enum udl_sink_plane plane)
@@ -686,6 +886,143 @@ void udl_sink_clear_damage(struct udl_sink_damage *damage)
     memset(damage, 0, sizeof(*damage));
 }
 
+void udl_transport_init(struct udl_transport *transport,
+                        struct udl_sink *sink)
+{
+    if (!transport) {
+        return;
+    }
+
+    memset(transport, 0, sizeof(*transport));
+    transport->sink = sink;
+}
+
+void udl_transport_reset(struct udl_transport *transport)
+{
+    if (!transport) {
+        return;
+    }
+
+    transport->pending_len = 0u;
+    memset(&transport->stats, 0, sizeof(transport->stats));
+}
+
+void udl_transport_destroy(struct udl_transport *transport)
+{
+    if (!transport) {
+        return;
+    }
+
+    free(transport->pending);
+    transport->pending = NULL;
+    transport->pending_len = 0u;
+    transport->pending_capacity = 0u;
+    memset(&transport->stats, 0, sizeof(transport->stats));
+}
+
+enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
+                                             const uint8_t *buffer,
+                                             size_t length,
+                                             struct udl_sink_damage *damage)
+{
+    enum udl_transport_result reserve_result;
+
+    if (!transport || !transport->sink) {
+        return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
+    }
+    if (length == 0u) {
+        if (damage) {
+            udl_sink_clear_damage(damage);
+        }
+        return UDL_TRANSPORT_OK;
+    }
+    if (!buffer) {
+        return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
+    }
+
+    if (damage) {
+        udl_sink_clear_damage(damage);
+    }
+
+    reserve_result = udl_transport_reserve_pending(transport, length);
+    if (reserve_result != UDL_TRANSPORT_OK) {
+        return reserve_result;
+    }
+
+    memcpy(transport->pending + transport->pending_len, buffer, length);
+    transport->pending_len += length;
+
+    while (transport->pending_len > 0u) {
+        uint8_t *sync;
+        size_t command_len = 0u;
+        enum udl_stream_parse_result parse_result;
+        struct udl_sink_damage command_damage;
+        enum udl_sink_result decode_result;
+
+        sync = memchr(transport->pending, UDL_MSG_BULK, transport->pending_len);
+        if (!sync) {
+            transport->stats.dropped_bytes += transport->pending_len;
+            transport->pending_len = 0u;
+            break;
+        }
+        if (sync != transport->pending) {
+            size_t skipped = (size_t)(sync - transport->pending);
+
+            transport->stats.dropped_bytes += skipped;
+            udl_transport_consume(transport, skipped);
+        }
+
+        if (transport->pending_len < 2u) {
+            break;
+        }
+        if (transport->pending[1] == UDL_MSG_BULK) {
+            udl_transport_consume(transport, 1u);
+            continue;
+        }
+
+        parse_result = udl_transport_next_command_length(transport->pending,
+                                                         transport->pending_len,
+                                                         &command_len);
+        if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
+            break;
+        }
+        if (parse_result == UDL_STREAM_PARSE_INVALID) {
+            transport->stats.decode_errors += 1u;
+            udl_transport_consume(transport, 1u);
+            continue;
+        }
+
+        udl_sink_clear_damage(&command_damage);
+        decode_result = udl_sink_decode_buffer(transport->sink,
+                                               transport->pending,
+                                               command_len,
+                                               &command_damage);
+        if (decode_result != UDL_SINK_OK) {
+            transport->stats.decode_errors += 1u;
+            udl_transport_consume(transport, command_len);
+            continue;
+        }
+
+        transport->stats.decoded_commands += 1u;
+        udl_sink_merge_damage(damage, &command_damage);
+        udl_transport_consume(transport, command_len);
+    }
+
+    return UDL_TRANSPORT_OK;
+}
+
+struct udl_transport_stats udl_transport_get_stats(const struct udl_transport *transport)
+{
+    struct udl_transport_stats stats;
+
+    memset(&stats, 0, sizeof(stats));
+    if (!transport) {
+        return stats;
+    }
+
+    return transport->stats;
+}
+
 enum udl_sink_result udl_sink_decode_buffer(struct udl_sink *sink,
                                             const uint8_t *buffer,
                                             size_t length,
@@ -814,6 +1151,20 @@ const char *udl_sink_result_string(enum udl_sink_result result)
         return "invalid command";
     case UDL_SINK_ERR_ADDRESS_RANGE:
         return "address range";
+    default:
+        return "unknown";
+    }
+}
+
+const char *udl_transport_result_string(enum udl_transport_result result)
+{
+    switch (result) {
+    case UDL_TRANSPORT_OK:
+        return "ok";
+    case UDL_TRANSPORT_ERR_INVALID_ARGUMENT:
+        return "invalid argument";
+    case UDL_TRANSPORT_ERR_NO_MEMORY:
+        return "no memory";
     default:
         return "unknown";
     }

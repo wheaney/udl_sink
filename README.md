@@ -20,8 +20,9 @@ The sink now decodes into internal 16bpp and 8bpp device planes, applies the bas
 
 - The existing caller-provided RGB565 framebuffer is still supported as a compatibility output.
 - An optional XRGB8888 output can be attached with `udl_sink_attach_xrgb8888_output()` to preserve full 24bpp reconstruction when the stream uses the 8bpp sidecar plane.
+- `udl_transport` now owns the reusable bulk-stream reassembly path so callers can feed transport-sized reads directly into the library.
 
-USB transport and packet reassembly are still intentionally left out of this slice. The current kernel DRM driver in `udl_ref` still initializes only the 16bpp path, but the sink can now decode 24bpp-style command streams on the receiving side.
+The current kernel DRM driver in `udl_ref` still initializes only the 16bpp path, but the sink can now decode 24bpp-style command streams on the receiving side.
 
 ## Build
 

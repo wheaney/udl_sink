@@ -414,6 +414,80 @@ static void test_writerlx8_compose_xrgb8888(void)
     udl_sink_destroy(&sink);
 }
 
+static void test_transport_reassembles_split_commands(void)
+{
+    uint16_t framebuffer[4] = {0};
+    struct udl_sink sink;
+    struct udl_transport transport;
+    struct udl_sink_damage damage;
+    struct udl_transport_stats stats;
+    const uint8_t packet[] = {
+        0xaf, 0x68, 0x00, 0x00, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78,
+        0xaf, 0x69, 0x00, 0x00, 0x04, 0x02, 0x9a, 0xbc,
+    };
+
+    udl_sink_init(&sink, framebuffer, 4u, 1u, 4u);
+    udl_transport_init(&transport, &sink);
+
+    assert(udl_transport_feed(&transport, packet, 5u, &damage) == UDL_TRANSPORT_OK);
+    assert(!damage.touched);
+
+    assert(udl_transport_feed(&transport, packet + 5u, sizeof(packet) - 5u, &damage) == UDL_TRANSPORT_OK);
+    assert(framebuffer[0] == 0x1234u);
+    assert(framebuffer[1] == 0x5678u);
+    assert(framebuffer[2] == 0x9abcu);
+    assert(framebuffer[3] == 0x9abcu);
+    assert(damage.touched);
+    assert(damage.x1 == 0u);
+    assert(damage.y1 == 0u);
+    assert(damage.x2 == 4u);
+    assert(damage.y2 == 1u);
+    assert(damage.pixel_count == 4u);
+
+    stats = udl_transport_get_stats(&transport);
+    assert(stats.decoded_commands == 2u);
+    assert(stats.decode_errors == 0u);
+    assert(stats.dropped_bytes == 0u);
+
+    udl_transport_destroy(&transport);
+    udl_sink_destroy(&sink);
+}
+
+static void test_transport_drops_noise_and_recovers_from_invalid_framing(void)
+{
+    uint16_t framebuffer[2] = {0};
+    struct udl_sink sink;
+    struct udl_transport transport;
+    struct udl_sink_damage damage;
+    struct udl_transport_stats stats;
+    const uint8_t packet[] = {
+        0x55, 0x66,
+        0xaf, 0x7f,
+        0xaf, 0x68, 0x00, 0x00, 0x00, 0x02, 0xaa, 0xaa, 0xbb, 0xbb,
+    };
+
+    udl_sink_init(&sink, framebuffer, 2u, 1u, 2u);
+    udl_transport_init(&transport, &sink);
+
+    assert(udl_transport_feed(&transport, packet, sizeof(packet), &damage) == UDL_TRANSPORT_OK);
+    assert(framebuffer[0] == 0xaaaau);
+    assert(framebuffer[1] == 0xbbbbu);
+    assert(damage.touched);
+    assert(damage.x1 == 0u);
+    assert(damage.y1 == 0u);
+    assert(damage.x2 == 2u);
+    assert(damage.y2 == 1u);
+    assert(damage.pixel_count == 2u);
+
+    stats = udl_transport_get_stats(&transport);
+    assert(stats.decoded_commands == 1u);
+    assert(stats.decode_errors == 1u);
+    assert(stats.dropped_bytes == 3u);
+
+    udl_transport_destroy(&transport);
+    udl_sink_destroy(&sink);
+}
+
 int main(void)
 {
     test_writerlx16_decodes_damage();
@@ -424,5 +498,7 @@ int main(void)
     test_24bpp_raw8_base_offsets_compose_xrgb8888();
     test_writerl8_and_writecopy8_compose_xrgb8888();
     test_writerlx8_compose_xrgb8888();
+    test_transport_reassembles_split_commands();
+    test_transport_drops_noise_and_recovers_from_invalid_framing();
     return 0;
 }
