@@ -576,6 +576,39 @@ static void udl_sink_mark_pixel(struct udl_sink_damage *damage,
     damage->pixel_count += 1u;
 }
 
+static void udl_sink_mark_span(struct udl_sink_damage *damage,
+                               uint32_t x,
+                               uint32_t y,
+                               uint32_t pixel_count)
+{
+    if (!damage || pixel_count == 0u) {
+        return;
+    }
+
+    if (!damage->touched) {
+        damage->touched = true;
+        damage->x1 = x;
+        damage->y1 = y;
+        damage->x2 = x + pixel_count;
+        damage->y2 = y + 1u;
+    } else {
+        if (x < damage->x1) {
+            damage->x1 = x;
+        }
+        if (y < damage->y1) {
+            damage->y1 = y;
+        }
+        if (x + pixel_count > damage->x2) {
+            damage->x2 = x + pixel_count;
+        }
+        if (y + 1u > damage->y2) {
+            damage->y2 = y + 1u;
+        }
+    }
+
+    damage->pixel_count += pixel_count;
+}
+
 static void udl_sink_compose_channels(const struct udl_sink *sink,
                                       uint32_t pixel_index,
                                       uint8_t *red,
@@ -654,6 +687,15 @@ static void udl_sink_compose_pixel(struct udl_sink *sink,
     if (udl_sink_store_output_pixel(sink, pixel_index, xrgb8888)) {
         udl_sink_mark_pixel(damage, x, y);
     }
+}
+
+static uint32_t udl_sink_rgb565_to_xrgb8888(uint16_t pixel16)
+{
+    const uint8_t red = udl_sink_expand5_to8((uint8_t)((pixel16 >> 11) & 0x1fu));
+    const uint8_t green = udl_sink_expand6_to8((uint8_t)((pixel16 >> 5) & 0x3fu));
+    const uint8_t blue = udl_sink_expand5_to8((uint8_t)(pixel16 & 0x1fu));
+
+    return 0xff000000u | ((uint32_t)red << 16) | ((uint32_t)green << 8) | blue;
 }
 
 static void udl_sink_compose_all(struct udl_sink *sink, struct udl_sink_damage *damage)
@@ -758,6 +800,7 @@ static void udl_sink_fill_plane16(struct udl_sink *sink,
                                   struct udl_sink_damage *damage)
 {
     uint16_t *dst = sink->plane16 + first_pixel;
+    const bool fast_path_16bpp = udl_sink_get_color_depth(sink) != UDL_COLORDEPTH_24BPP;
     uint32_t i;
 
     if (pixel_count == 0u) {
@@ -765,6 +808,54 @@ static void udl_sink_fill_plane16(struct udl_sink *sink,
     }
 
     if (pixel_count >= 8u && udl_sink_plane16_span_all_equal(dst, pixel_count, pixel)) {
+        return;
+    }
+
+    if (fast_path_16bpp) {
+        const uint32_t width = sink->width;
+        const uint32_t xrgb8888 = udl_sink_rgb565_to_xrgb8888(pixel);
+        uint32_t remaining = pixel_count;
+        uint32_t pixel_index = first_pixel;
+
+        while (remaining > 0u) {
+            const uint32_t x = pixel_index % width;
+            const uint32_t y = pixel_index / width;
+            const uint32_t row_pixels = (remaining < (width - x)) ? remaining : (width - x);
+            uint16_t *row_plane16 = sink->plane16 + pixel_index;
+            uint16_t *row_fb16 = sink->framebuffer ? sink->framebuffer + (y * sink->stride_pixels) + x : NULL;
+            uint32_t *row_fb32 = sink->framebuffer_xrgb8888
+                ? sink->framebuffer_xrgb8888 + (y * sink->stride_pixels_xrgb8888) + x
+                : NULL;
+            uint32_t row_offset = 0u;
+
+            while (row_offset < row_pixels) {
+                if (row_plane16[row_offset] == pixel) {
+                    row_offset += 1u;
+                    continue;
+                }
+
+                {
+                    const uint32_t run_start = row_offset;
+
+                    do {
+                        row_plane16[row_offset] = pixel;
+                        if (row_fb16) {
+                            row_fb16[row_offset] = pixel;
+                        }
+                        if (row_fb32) {
+                            row_fb32[row_offset] = xrgb8888;
+                        }
+                        row_offset += 1u;
+                    } while (row_offset < row_pixels && row_plane16[row_offset] != pixel);
+
+                    udl_sink_mark_span(damage, x + run_start, y, row_offset - run_start);
+                }
+            }
+
+            pixel_index += row_pixels;
+            remaining -= row_pixels;
+        }
+
         return;
     }
 
