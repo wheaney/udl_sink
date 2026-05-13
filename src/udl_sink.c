@@ -856,6 +856,8 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
         size_t raw_bytes;
         uint16_t repeated_pixel16 = 0u;
         uint8_t repeated_pixel8 = 0u;
+        uint16_t raw_first_pixel16 = 0u;
+        uint8_t raw_first_pixel8 = 0u;
 
         if (offset >= remaining) {
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
@@ -870,6 +872,14 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
         raw_bytes = (size_t)raw_count * bytes_per_pixel;
         if (remaining - offset < raw_bytes) {
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
+        }
+
+        if (raw_count > 0u) {
+            if (plane == UDL_SINK_PLANE_16) {
+                raw_first_pixel16 = udl_sink_read_be16(&command[offset]);
+            } else {
+                raw_first_pixel8 = command[offset];
+            }
         }
 
         if (plane == UDL_SINK_PLANE_16) {
@@ -908,6 +918,27 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
 
             if (repeat_count == 0u || repeat_count > total_pixels - produced) {
                 return UDL_SINK_ERR_INVALID_COMMAND;
+            }
+
+            if (raw_count == 1u) {
+                if (plane == UDL_SINK_PLANE_16 && raw_first_pixel16 == repeated_pixel16) {
+                    udl_sink_fill_plane16(sink,
+                                          first_pixel + produced - 1u,
+                                          repeat_count + 1u,
+                                          repeated_pixel16,
+                                          damage);
+                    produced += repeat_count;
+                    continue;
+                }
+                if (plane == UDL_SINK_PLANE_8 && raw_first_pixel8 == repeated_pixel8) {
+                    udl_sink_fill_plane8(sink,
+                                         first_pixel + produced - 1u,
+                                         repeat_count + 1u,
+                                         repeated_pixel8,
+                                         damage);
+                    produced += repeat_count;
+                    continue;
+                }
             }
 
             if (plane == UDL_SINK_PLANE_16) {
