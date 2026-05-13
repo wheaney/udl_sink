@@ -132,6 +132,7 @@ static void udl_transport_record_command_type(struct udl_transport_stats *stats,
 static enum udl_stream_parse_result udl_transport_parse_writerlx_length(const uint8_t *command,
                                                                         size_t length,
                                                                         size_t bytes_per_pixel,
+                                                                        struct udl_transport_stats *stats,
                                                                         size_t *command_len_out)
 {
     uint32_t produced = 0u;
@@ -156,6 +157,13 @@ static enum udl_stream_parse_result udl_transport_parse_writerlx_length(const ui
         if (raw_count > total_pixels - produced) {
             return UDL_STREAM_PARSE_INVALID;
         }
+        if (stats && command[1] == UDL_CMD_WRITERLX16) {
+            stats->writerlx16_raw_spans += 1u;
+            stats->writerlx16_raw_pixels += raw_count;
+            if (raw_count == 1u) {
+                stats->writerlx16_raw_single_pixel_spans += 1u;
+            }
+        }
 
         raw_bytes = (size_t)raw_count * bytes_per_pixel;
         if (length - offset < raw_bytes) {
@@ -176,6 +184,10 @@ static enum udl_stream_parse_result udl_transport_parse_writerlx_length(const ui
         offset += 1u;
         if (repeat_count == 0u || repeat_count > total_pixels - produced) {
             return UDL_STREAM_PARSE_INVALID;
+        }
+        if (stats && command[1] == UDL_CMD_WRITERLX16) {
+            stats->writerlx16_repeat_spans += 1u;
+            stats->writerlx16_repeat_pixels += repeat_count;
         }
 
         produced += repeat_count;
@@ -220,7 +232,7 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
         command_len = 9u;
         break;
     case UDL_CMD_WRITERLX8:
-        return udl_transport_parse_writerlx_length(command, length, 1u, command_len_out);
+        return udl_transport_parse_writerlx_length(command, length, 1u, NULL, command_len_out);
     case UDL_CMD_WRITERAW16:
         if (length < 6u) {
             return UDL_STREAM_PARSE_NEED_MORE;
@@ -235,7 +247,7 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
         command_len = 9u;
         break;
     case UDL_CMD_WRITERLX16:
-        return udl_transport_parse_writerlx_length(command, length, 2u, command_len_out);
+        return udl_transport_parse_writerlx_length(command, length, 2u, NULL, command_len_out);
     default:
         return UDL_STREAM_PARSE_INVALID;
     }
@@ -1170,9 +1182,17 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
 
         command_type = transport->pending[1];
 
-        parse_result = udl_transport_next_command_length(transport->pending,
-                                                         transport->pending_len,
-                                                         &command_len);
+        if (command_type == UDL_CMD_WRITERLX16) {
+            parse_result = udl_transport_parse_writerlx_length(transport->pending,
+                                                               transport->pending_len,
+                                                               2u,
+                                                               &transport->stats,
+                                                               &command_len);
+        } else {
+            parse_result = udl_transport_next_command_length(transport->pending,
+                                                             transport->pending_len,
+                                                             &command_len);
+        }
         if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
             break;
         }

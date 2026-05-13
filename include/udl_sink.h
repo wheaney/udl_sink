@@ -48,6 +48,11 @@ struct udl_transport_stats {
     uint64_t writerl16_commands;
     uint64_t writecopy16_commands;
     uint64_t writerlx16_commands;
+    uint64_t writerlx16_raw_spans;
+    uint64_t writerlx16_repeat_spans;
+    uint64_t writerlx16_raw_pixels;
+    uint64_t writerlx16_repeat_pixels;
+    uint64_t writerlx16_raw_single_pixel_spans;
     uint64_t no_damage_commands;
 };
 
