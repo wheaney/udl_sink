@@ -721,22 +721,61 @@ static void udl_sink_write_plane8(struct udl_sink *sink,
     udl_sink_compose_pixel(sink, pixel_index, damage);
 }
 
+static bool udl_sink_plane16_span_all_equal(const uint16_t *pixels,
+                                            uint32_t pixel_count,
+                                            uint16_t pixel)
+{
+    uint32_t index = 0u;
+
+    while (index + 8u <= pixel_count) {
+        if (pixels[index] != pixel ||
+            pixels[index + 1u] != pixel ||
+            pixels[index + 2u] != pixel ||
+            pixels[index + 3u] != pixel ||
+            pixels[index + 4u] != pixel ||
+            pixels[index + 5u] != pixel ||
+            pixels[index + 6u] != pixel ||
+            pixels[index + 7u] != pixel) {
+            return false;
+        }
+        index += 8u;
+    }
+
+    while (index < pixel_count) {
+        if (pixels[index] != pixel) {
+            return false;
+        }
+        index += 1u;
+    }
+
+    return true;
+}
+
 static void udl_sink_fill_plane16(struct udl_sink *sink,
                                   uint32_t first_pixel,
                                   uint32_t pixel_count,
                                   uint16_t pixel,
                                   struct udl_sink_damage *damage)
 {
+    uint16_t *dst = sink->plane16 + first_pixel;
     uint32_t i;
+
+    if (pixel_count == 0u) {
+        return;
+    }
+
+    if (pixel_count >= 8u && udl_sink_plane16_span_all_equal(dst, pixel_count, pixel)) {
+        return;
+    }
 
     for (i = 0; i < pixel_count; ++i) {
         const uint32_t pixel_index = first_pixel + i;
 
-        if (sink->plane16[pixel_index] == pixel) {
+        if (dst[i] == pixel) {
             continue;
         }
 
-        sink->plane16[pixel_index] = pixel;
+        dst[i] = pixel;
         udl_sink_compose_pixel(sink, pixel_index, damage);
     }
 }
