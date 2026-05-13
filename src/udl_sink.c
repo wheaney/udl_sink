@@ -89,6 +89,46 @@ static void udl_sink_merge_damage(struct udl_sink_damage *dst,
     dst->pixel_count += src->pixel_count;
 }
 
+static void udl_transport_record_command_type(struct udl_transport_stats *stats,
+                                              uint8_t command_type)
+{
+    if (!stats) {
+        return;
+    }
+
+    switch (command_type) {
+    case UDL_CMD_WRITEREG:
+        stats->writereg_commands += 1u;
+        break;
+    case UDL_CMD_WRITERAW8:
+        stats->writeraw8_commands += 1u;
+        break;
+    case UDL_CMD_WRITERL8:
+        stats->writerl8_commands += 1u;
+        break;
+    case UDL_CMD_WRITECOPY8:
+        stats->writecopy8_commands += 1u;
+        break;
+    case UDL_CMD_WRITERLX8:
+        stats->writerlx8_commands += 1u;
+        break;
+    case UDL_CMD_WRITERAW16:
+        stats->writeraw16_commands += 1u;
+        break;
+    case UDL_CMD_WRITERL16:
+        stats->writerl16_commands += 1u;
+        break;
+    case UDL_CMD_WRITECOPY16:
+        stats->writecopy16_commands += 1u;
+        break;
+    case UDL_CMD_WRITERLX16:
+        stats->writerlx16_commands += 1u;
+        break;
+    default:
+        break;
+    }
+}
+
 static enum udl_stream_parse_result udl_transport_parse_writerlx_length(const uint8_t *command,
                                                                         size_t length,
                                                                         size_t bytes_per_pixel,
@@ -955,6 +995,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
     while (transport->pending_len > 0u) {
         uint8_t *sync;
         size_t command_len = 0u;
+        uint8_t command_type = 0u;
         enum udl_stream_parse_result parse_result;
         struct udl_sink_damage command_damage;
         enum udl_sink_result decode_result;
@@ -980,6 +1021,8 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
             continue;
         }
 
+        command_type = transport->pending[1];
+
         parse_result = udl_transport_next_command_length(transport->pending,
                                                          transport->pending_len,
                                                          &command_len);
@@ -993,6 +1036,15 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         }
 
         udl_sink_clear_damage(&command_damage);
+        udl_transport_record_command_type(&transport->stats, command_type);
+        if (command_type == UDL_CMD_WRITEREG && command_len >= 4u) {
+            const uint8_t reg = transport->pending[2];
+            const uint8_t value = transport->pending[3];
+
+            if (transport->sink->registers[reg] == value) {
+                transport->stats.writereg_redundant_commands += 1u;
+            }
+        }
         decode_result = udl_sink_decode_buffer(transport->sink,
                                                transport->pending,
                                                command_len,
@@ -1004,6 +1056,9 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         }
 
         transport->stats.decoded_commands += 1u;
+        if (!command_damage.touched) {
+            transport->stats.no_damage_commands += 1u;
+        }
         udl_sink_merge_damage(damage, &command_damage);
         udl_transport_consume(transport, command_len);
     }

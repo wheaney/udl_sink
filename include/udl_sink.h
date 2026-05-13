@@ -38,6 +38,17 @@ struct udl_transport_stats {
     uint64_t decoded_commands;
     uint64_t decode_errors;
     uint64_t dropped_bytes;
+    uint64_t writereg_commands;
+    uint64_t writereg_redundant_commands;
+    uint64_t writeraw8_commands;
+    uint64_t writerl8_commands;
+    uint64_t writecopy8_commands;
+    uint64_t writerlx8_commands;
+    uint64_t writeraw16_commands;
+    uint64_t writerl16_commands;
+    uint64_t writecopy16_commands;
+    uint64_t writerlx16_commands;
+    uint64_t no_damage_commands;
 };
 
 struct udl_sink {
