@@ -624,6 +624,48 @@ static void udl_sink_fill_plane8(struct udl_sink *sink,
     }
 }
 
+static void udl_sink_blit_plane16_be(struct udl_sink *sink,
+                                     uint32_t first_pixel,
+                                     const uint8_t *src,
+                                     uint32_t pixel_count,
+                                     struct udl_sink_damage *damage)
+{
+    uint32_t i;
+
+    for (i = 0; i < pixel_count; ++i) {
+        const uint32_t pixel_index = first_pixel + i;
+        const uint16_t pixel = udl_sink_read_be16(&src[(size_t)i * 2u]);
+
+        if (sink->plane16[pixel_index] == pixel) {
+            continue;
+        }
+
+        sink->plane16[pixel_index] = pixel;
+        udl_sink_compose_pixel(sink, pixel_index, damage);
+    }
+}
+
+static void udl_sink_blit_plane8(struct udl_sink *sink,
+                                 uint32_t first_pixel,
+                                 const uint8_t *src,
+                                 uint32_t pixel_count,
+                                 struct udl_sink_damage *damage)
+{
+    uint32_t i;
+
+    for (i = 0; i < pixel_count; ++i) {
+        const uint32_t pixel_index = first_pixel + i;
+        const uint8_t pixel = src[i];
+
+        if (sink->plane8[pixel_index] == pixel) {
+            continue;
+        }
+
+        sink->plane8[pixel_index] = pixel;
+        udl_sink_compose_pixel(sink, pixel_index, damage);
+    }
+}
+
 static enum udl_sink_result udl_sink_decode_writereg(struct udl_sink *sink,
                                                      const uint8_t *command,
                                                      size_t remaining,
@@ -661,7 +703,6 @@ static enum udl_sink_result udl_sink_decode_writeraw(struct udl_sink *sink,
     const size_t command_size = 6u + payload_bytes;
     enum udl_sink_result result;
     uint32_t first_pixel;
-    uint32_t i;
 
     if (remaining < 6u) {
         return UDL_SINK_ERR_TRUNCATED_COMMAND;
@@ -675,14 +716,18 @@ static enum udl_sink_result udl_sink_decode_writeraw(struct udl_sink *sink,
         return result;
     }
 
-    for (i = 0; i < pixel_count; ++i) {
-        if (plane == UDL_SINK_PLANE_16) {
-            const uint16_t pixel = udl_sink_read_be16(&command[6u + (size_t)i * 2u]);
-
-            udl_sink_write_plane16(sink, first_pixel + i, pixel, damage);
-        } else {
-            udl_sink_write_plane8(sink, first_pixel + i, command[6u + i], damage);
-        }
+    if (plane == UDL_SINK_PLANE_16) {
+        udl_sink_blit_plane16_be(sink,
+                                 first_pixel,
+                                 &command[6],
+                                 pixel_count,
+                                 damage);
+    } else {
+        udl_sink_blit_plane8(sink,
+                             first_pixel,
+                             &command[6],
+                             pixel_count,
+                             damage);
     }
 
     *consumed = command_size;
@@ -811,7 +856,6 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
         size_t raw_bytes;
         uint16_t repeated_pixel16 = 0u;
         uint8_t repeated_pixel8 = 0u;
-        uint32_t i;
 
         if (offset >= remaining) {
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
@@ -828,17 +872,18 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
         }
 
-        for (i = 0; i < raw_count; ++i) {
-            if (plane == UDL_SINK_PLANE_16) {
-                const uint16_t pixel = udl_sink_read_be16(&command[offset + (size_t)i * 2u]);
-
-                udl_sink_write_plane16(sink, first_pixel + produced + i, pixel, damage);
-            } else {
-                udl_sink_write_plane8(sink,
-                                      first_pixel + produced + i,
-                                      command[offset + i],
-                                      damage);
-            }
+        if (plane == UDL_SINK_PLANE_16) {
+            udl_sink_blit_plane16_be(sink,
+                                     first_pixel + produced,
+                                     &command[offset],
+                                     raw_count,
+                                     damage);
+        } else {
+            udl_sink_blit_plane8(sink,
+                                 first_pixel + produced,
+                                 &command[offset],
+                                 raw_count,
+                                 damage);
         }
 
         if (plane == UDL_SINK_PLANE_16) {
