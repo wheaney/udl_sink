@@ -563,6 +563,10 @@ static void udl_sink_write_plane16(struct udl_sink *sink,
                                    uint16_t pixel,
                                    struct udl_sink_damage *damage)
 {
+    if (sink->plane16[pixel_index] == pixel) {
+        return;
+    }
+
     sink->plane16[pixel_index] = pixel;
     udl_sink_compose_pixel(sink, pixel_index, damage);
 }
@@ -572,6 +576,10 @@ static void udl_sink_write_plane8(struct udl_sink *sink,
                                   uint8_t pixel,
                                   struct udl_sink_damage *damage)
 {
+    if (sink->plane8[pixel_index] == pixel) {
+        return;
+    }
+
     sink->plane8[pixel_index] = pixel;
     udl_sink_compose_pixel(sink, pixel_index, damage);
 }
