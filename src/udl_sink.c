@@ -39,6 +39,22 @@ enum udl_sink_plane {
     UDL_SINK_PLANE_16,
 };
 
+static enum udl_sink_result udl_sink_map_range(const struct udl_sink *sink,
+                                               enum udl_sink_plane plane,
+                                               uint32_t byte_address,
+                                               uint32_t pixel_count,
+                                               uint32_t *first_pixel_out);
+static void udl_sink_fill_plane16(struct udl_sink *sink,
+                                  uint32_t first_pixel,
+                                  uint32_t pixel_count,
+                                  uint16_t pixel,
+                                  struct udl_sink_damage *damage);
+static void udl_sink_blit_plane16_be(struct udl_sink *sink,
+                                     uint32_t first_pixel,
+                                     const uint8_t *src,
+                                     uint32_t pixel_count,
+                                     struct udl_sink_damage *damage);
+
 static uint16_t udl_sink_read_be16(const uint8_t *bytes)
 {
     return (uint16_t)(((uint16_t)bytes[0] << 8) | bytes[1]);
@@ -191,6 +207,115 @@ static enum udl_stream_parse_result udl_transport_parse_writerlx_length(const ui
         }
 
         produced += repeat_count;
+    }
+
+    *command_len_out = offset;
+    return UDL_STREAM_PARSE_COMPLETE;
+}
+
+static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_transport *transport,
+                                                                    const uint8_t *command,
+                                                                    size_t length,
+                                                                    struct udl_sink_damage *damage,
+                                                                    size_t *command_len_out)
+{
+    const uint32_t byte_address = udl_sink_read_addr24(&command[2]);
+    const uint32_t total_pixels = udl_sink_count_from_byte(command[5]);
+    struct udl_sink *sink = transport->sink;
+    uint32_t first_pixel;
+    uint32_t produced = 0u;
+    size_t offset = 6u;
+    enum udl_sink_result result;
+
+    if (length < 7u) {
+        return UDL_STREAM_PARSE_NEED_MORE;
+    }
+
+    result = udl_sink_map_range(sink, UDL_SINK_PLANE_16, byte_address, total_pixels, &first_pixel);
+    if (result == UDL_SINK_ERR_ADDRESS_RANGE || result == UDL_SINK_ERR_INVALID_COMMAND) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+    if (result != UDL_SINK_OK) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+
+    while (produced < total_pixels) {
+        uint32_t raw_count;
+        size_t raw_bytes;
+        uint16_t repeated_pixel16;
+        uint16_t raw_first_pixel16 = 0u;
+
+        if (offset >= length) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        raw_count = udl_sink_count_from_byte(command[offset]);
+        offset += 1u;
+        if (raw_count > total_pixels - produced) {
+            return UDL_STREAM_PARSE_INVALID;
+        }
+
+        transport->stats.writerlx16_raw_spans += 1u;
+        transport->stats.writerlx16_raw_pixels += raw_count;
+        if (raw_count == 1u) {
+            transport->stats.writerlx16_raw_single_pixel_spans += 1u;
+        }
+
+        raw_bytes = (size_t)raw_count * 2u;
+        if (length - offset < raw_bytes) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        if (raw_count > 0u) {
+            raw_first_pixel16 = udl_sink_read_be16(&command[offset]);
+        }
+
+        udl_sink_blit_plane16_be(sink,
+                                 first_pixel + produced,
+                                 &command[offset],
+                                 raw_count,
+                                 damage);
+
+        repeated_pixel16 = udl_sink_read_be16(&command[offset + raw_bytes - 2u]);
+        offset += raw_bytes;
+        produced += raw_count;
+
+        if (produced == total_pixels) {
+            break;
+        }
+
+        if (offset >= length) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        {
+            const uint32_t repeat_count = command[offset];
+            offset += 1u;
+
+            if (repeat_count == 0u || repeat_count > total_pixels - produced) {
+                return UDL_STREAM_PARSE_INVALID;
+            }
+
+            transport->stats.writerlx16_repeat_spans += 1u;
+            transport->stats.writerlx16_repeat_pixels += repeat_count;
+
+            if (raw_count == 1u && raw_first_pixel16 == repeated_pixel16) {
+                udl_sink_fill_plane16(sink,
+                                      first_pixel + produced - 1u,
+                                      repeat_count + 1u,
+                                      repeated_pixel16,
+                                      damage);
+                produced += repeat_count;
+                continue;
+            }
+
+            udl_sink_fill_plane16(sink,
+                                  first_pixel + produced,
+                                  repeat_count,
+                                  repeated_pixel16,
+                                  damage);
+            produced += repeat_count;
+        }
     }
 
     *command_len_out = offset;
@@ -1183,11 +1308,29 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         command_type = transport->pending[1];
 
         if (command_type == UDL_CMD_WRITERLX16) {
-            parse_result = udl_transport_parse_writerlx_length(transport->pending,
-                                                               transport->pending_len,
-                                                               2u,
-                                                               &transport->stats,
-                                                               &command_len);
+            udl_sink_clear_damage(&command_damage);
+            udl_transport_record_command_type(&transport->stats, command_type);
+            parse_result = udl_transport_decode_writerlx16(transport,
+                                                           transport->pending,
+                                                           transport->pending_len,
+                                                           &command_damage,
+                                                           &command_len);
+            if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
+                break;
+            }
+            if (parse_result == UDL_STREAM_PARSE_INVALID) {
+                transport->stats.decode_errors += 1u;
+                udl_transport_consume(transport, 1u);
+                continue;
+            }
+
+            transport->stats.decoded_commands += 1u;
+            if (!command_damage.touched) {
+                transport->stats.no_damage_commands += 1u;
+            }
+            udl_sink_merge_damage(damage, &command_damage);
+            udl_transport_consume(transport, command_len);
+            continue;
         } else {
             parse_result = udl_transport_next_command_length(transport->pending,
                                                              transport->pending_len,
