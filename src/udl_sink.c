@@ -1061,6 +1061,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                              struct udl_sink_damage *damage)
 {
     enum udl_transport_result reserve_result;
+    enum udl_sink_result sink_result;
 
     if (!transport || !transport->sink) {
         return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
@@ -1079,6 +1080,25 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         udl_sink_clear_damage(damage);
     }
 
+    if (transport->sink->width == 0u || transport->sink->height == 0u) {
+        return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
+    }
+    if (transport->sink->framebuffer &&
+        transport->sink->stride_pixels < transport->sink->width) {
+        return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
+    }
+    if (transport->sink->framebuffer_xrgb8888 &&
+        transport->sink->stride_pixels_xrgb8888 < transport->sink->width) {
+        return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
+    }
+
+    sink_result = udl_sink_ensure_planes(transport->sink);
+    if (sink_result != UDL_SINK_OK) {
+        return sink_result == UDL_SINK_ERR_NO_MEMORY
+            ? UDL_TRANSPORT_ERR_NO_MEMORY
+            : UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
+    }
+
     reserve_result = udl_transport_reserve_pending(transport, length);
     if (reserve_result != UDL_TRANSPORT_OK) {
         return reserve_result;
@@ -1090,6 +1110,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
     while (transport->pending_len > 0u) {
         uint8_t *sync;
         size_t command_len = 0u;
+        size_t consumed = 0u;
         uint8_t command_type = 0u;
         enum udl_stream_parse_result parse_result;
         struct udl_sink_damage command_damage;
@@ -1140,11 +1161,17 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                 transport->stats.writereg_redundant_commands += 1u;
             }
         }
-        decode_result = udl_sink_decode_buffer(transport->sink,
-                                               transport->pending,
-                                               command_len,
-                                               &command_damage);
+        decode_result = udl_sink_decode_command(transport->sink,
+                                                transport->pending,
+                                                command_len,
+                                                &consumed,
+                                                &command_damage);
         if (decode_result != UDL_SINK_OK) {
+            transport->stats.decode_errors += 1u;
+            udl_transport_consume(transport, command_len);
+            continue;
+        }
+        if (consumed != command_len) {
             transport->stats.decode_errors += 1u;
             udl_transport_consume(transport, command_len);
             continue;
