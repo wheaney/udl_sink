@@ -244,6 +244,7 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
         size_t raw_bytes;
         uint16_t repeated_pixel16;
         uint16_t raw_first_pixel16 = 0u;
+        const uint8_t *raw_data;
 
         if (offset >= length) {
             return UDL_STREAM_PARSE_NEED_MORE;
@@ -266,21 +267,22 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
             return UDL_STREAM_PARSE_NEED_MORE;
         }
 
+        raw_data = &command[offset];
+
         if (raw_count > 0u) {
-            raw_first_pixel16 = udl_sink_read_be16(&command[offset]);
+            raw_first_pixel16 = udl_sink_read_be16(raw_data);
         }
 
-        udl_sink_blit_plane16_be(sink,
-                                 first_pixel + produced,
-                                 &command[offset],
-                                 raw_count,
-                                 damage);
-
-        repeated_pixel16 = udl_sink_read_be16(&command[offset + raw_bytes - 2u]);
+        repeated_pixel16 = udl_sink_read_be16(&raw_data[raw_bytes - 2u]);
         offset += raw_bytes;
-        produced += raw_count;
 
-        if (produced == total_pixels) {
+        if (produced + raw_count == total_pixels) {
+            udl_sink_blit_plane16_be(sink,
+                                     first_pixel + produced,
+                                     raw_data,
+                                     raw_count,
+                                     damage);
+            produced += raw_count;
             break;
         }
 
@@ -301,13 +303,20 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
 
             if (raw_count == 1u && raw_first_pixel16 == repeated_pixel16) {
                 udl_sink_fill_plane16(sink,
-                                      first_pixel + produced - 1u,
+                                      first_pixel + produced,
                                       repeat_count + 1u,
                                       repeated_pixel16,
                                       damage);
-                produced += repeat_count;
+                produced += repeat_count + 1u;
                 continue;
             }
+
+            udl_sink_blit_plane16_be(sink,
+                                     first_pixel + produced,
+                                     raw_data,
+                                     raw_count,
+                                     damage);
+            produced += raw_count;
 
             udl_sink_fill_plane16(sink,
                                   first_pixel + produced,
@@ -1125,6 +1134,7 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
         uint8_t repeated_pixel8 = 0u;
         uint16_t raw_first_pixel16 = 0u;
         uint8_t raw_first_pixel8 = 0u;
+        const uint8_t *raw_data;
 
         if (offset >= remaining) {
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
@@ -1141,37 +1151,38 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
         }
 
+        raw_data = &command[offset];
+
         if (raw_count > 0u) {
             if (plane == UDL_SINK_PLANE_16) {
-                raw_first_pixel16 = udl_sink_read_be16(&command[offset]);
+                raw_first_pixel16 = udl_sink_read_be16(raw_data);
             } else {
-                raw_first_pixel8 = command[offset];
+                raw_first_pixel8 = raw_data[0];
             }
         }
 
         if (plane == UDL_SINK_PLANE_16) {
-            udl_sink_blit_plane16_be(sink,
-                                     first_pixel + produced,
-                                     &command[offset],
-                                     raw_count,
-                                     damage);
+            repeated_pixel16 = udl_sink_read_be16(&raw_data[raw_bytes - 2u]);
         } else {
-            udl_sink_blit_plane8(sink,
-                                 first_pixel + produced,
-                                 &command[offset],
-                                 raw_count,
-                                 damage);
-        }
-
-        if (plane == UDL_SINK_PLANE_16) {
-            repeated_pixel16 = udl_sink_read_be16(&command[offset + raw_bytes - 2u]);
-        } else {
-            repeated_pixel8 = command[offset + raw_bytes - 1u];
+            repeated_pixel8 = raw_data[raw_bytes - 1u];
         }
         offset += raw_bytes;
-        produced += raw_count;
 
-        if (produced == total_pixels) {
+        if (produced + raw_count == total_pixels) {
+            if (plane == UDL_SINK_PLANE_16) {
+                udl_sink_blit_plane16_be(sink,
+                                         first_pixel + produced,
+                                         raw_data,
+                                         raw_count,
+                                         damage);
+            } else {
+                udl_sink_blit_plane8(sink,
+                                     first_pixel + produced,
+                                     raw_data,
+                                     raw_count,
+                                     damage);
+            }
+            produced += raw_count;
             break;
         }
 
@@ -1190,23 +1201,39 @@ static enum udl_sink_result udl_sink_decode_writerlx(struct udl_sink *sink,
             if (raw_count == 1u) {
                 if (plane == UDL_SINK_PLANE_16 && raw_first_pixel16 == repeated_pixel16) {
                     udl_sink_fill_plane16(sink,
-                                          first_pixel + produced - 1u,
+                                          first_pixel + produced,
                                           repeat_count + 1u,
                                           repeated_pixel16,
                                           damage);
-                    produced += repeat_count;
+                    produced += repeat_count + 1u;
                     continue;
                 }
                 if (plane == UDL_SINK_PLANE_8 && raw_first_pixel8 == repeated_pixel8) {
                     udl_sink_fill_plane8(sink,
-                                         first_pixel + produced - 1u,
+                                         first_pixel + produced,
                                          repeat_count + 1u,
                                          repeated_pixel8,
                                          damage);
-                    produced += repeat_count;
+                    produced += repeat_count + 1u;
                     continue;
                 }
             }
+
+            if (plane == UDL_SINK_PLANE_16) {
+                udl_sink_blit_plane16_be(sink,
+                                         first_pixel + produced,
+                                         raw_data,
+                                         raw_count,
+                                         damage);
+            } else {
+                udl_sink_blit_plane8(sink,
+                                     first_pixel + produced,
+                                     raw_data,
+                                     raw_count,
+                                     damage);
+            }
+
+            produced += raw_count;
 
             if (plane == UDL_SINK_PLANE_16) {
                 udl_sink_fill_plane16(sink,
