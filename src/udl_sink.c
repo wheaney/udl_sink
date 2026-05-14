@@ -802,6 +802,54 @@ static bool udl_sink_plane16_span_all_equal(const uint16_t *pixels,
     return true;
 }
 
+static void udl_sink_fill_u16(uint16_t *dst,
+                              uint32_t pixel_count,
+                              uint16_t pixel)
+{
+    uint32_t index = 0u;
+
+    while (index + 8u <= pixel_count) {
+        dst[index] = pixel;
+        dst[index + 1u] = pixel;
+        dst[index + 2u] = pixel;
+        dst[index + 3u] = pixel;
+        dst[index + 4u] = pixel;
+        dst[index + 5u] = pixel;
+        dst[index + 6u] = pixel;
+        dst[index + 7u] = pixel;
+        index += 8u;
+    }
+
+    while (index < pixel_count) {
+        dst[index] = pixel;
+        index += 1u;
+    }
+}
+
+static void udl_sink_fill_u32(uint32_t *dst,
+                              uint32_t pixel_count,
+                              uint32_t pixel)
+{
+    uint32_t index = 0u;
+
+    while (index + 8u <= pixel_count) {
+        dst[index] = pixel;
+        dst[index + 1u] = pixel;
+        dst[index + 2u] = pixel;
+        dst[index + 3u] = pixel;
+        dst[index + 4u] = pixel;
+        dst[index + 5u] = pixel;
+        dst[index + 6u] = pixel;
+        dst[index + 7u] = pixel;
+        index += 8u;
+    }
+
+    while (index < pixel_count) {
+        dst[index] = pixel;
+        index += 1u;
+    }
+}
+
 static void udl_sink_fill_plane16(struct udl_sink *sink,
                                   uint32_t first_pixel,
                                   uint32_t pixel_count,
@@ -847,15 +895,22 @@ static void udl_sink_fill_plane16(struct udl_sink *sink,
                     const uint32_t run_start = row_offset;
 
                     do {
-                        row_plane16[row_offset] = pixel;
-                        if (row_fb16) {
-                            row_fb16[row_offset] = pixel;
-                        }
-                        if (row_fb32) {
-                            row_fb32[row_offset] = xrgb8888;
-                        }
                         row_offset += 1u;
                     } while (row_offset < row_pixels && row_plane16[row_offset] != pixel);
+
+                    udl_sink_fill_u16(row_plane16 + run_start,
+                                      row_offset - run_start,
+                                      pixel);
+                    if (row_fb16) {
+                        udl_sink_fill_u16(row_fb16 + run_start,
+                                          row_offset - run_start,
+                                          pixel);
+                    }
+                    if (row_fb32) {
+                        udl_sink_fill_u32(row_fb32 + run_start,
+                                          row_offset - run_start,
+                                          xrgb8888);
+                    }
 
                     udl_sink_mark_span(damage, x + run_start, y, row_offset - run_start);
                 }
