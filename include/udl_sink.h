@@ -75,6 +75,7 @@ struct udl_transport {
     uint8_t *pending;
     size_t pending_len;
     size_t pending_capacity;
+    bool collect_detailed_stats;
     bool collect_writerlx16_span_stats;
     struct udl_transport_stats stats;
 };
@@ -95,6 +96,9 @@ void udl_sink_clear_damage(struct udl_sink_damage *damage);
 
 void udl_transport_init(struct udl_transport *transport,
                         struct udl_sink *sink);
+
+void udl_transport_set_detailed_stats(struct udl_transport *transport,
+                                      bool enabled);
 
 void udl_transport_set_writerlx16_span_stats(struct udl_transport *transport,
                                              bool enabled);

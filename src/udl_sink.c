@@ -301,7 +301,8 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
 {
     const uint32_t byte_address = udl_sink_read_addr24(&command[2]);
     const uint32_t total_pixels = udl_sink_count_from_byte(command[5]);
-    const bool collect_span_stats = transport->collect_writerlx16_span_stats;
+    const bool collect_span_stats = transport->collect_detailed_stats &&
+                                    transport->collect_writerlx16_span_stats;
     struct udl_sink *sink = transport->sink;
     uint64_t raw_spans = 0u;
     uint64_t raw_pixels = 0u;
@@ -1693,7 +1694,18 @@ void udl_transport_init(struct udl_transport *transport,
 
     memset(transport, 0, sizeof(*transport));
     transport->sink = sink;
+    transport->collect_detailed_stats = true;
     transport->collect_writerlx16_span_stats = true;
+}
+
+void udl_transport_set_detailed_stats(struct udl_transport *transport,
+                                      bool enabled)
+{
+    if (!transport) {
+        return;
+    }
+
+    transport->collect_detailed_stats = enabled;
 }
 
 void udl_transport_set_writerlx16_span_stats(struct udl_transport *transport,
@@ -1736,6 +1748,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
 {
     enum udl_transport_result reserve_result;
     enum udl_sink_result sink_result;
+    const bool collect_detailed_stats = transport && transport->collect_detailed_stats;
     size_t offset = 0u;
     struct udl_transport_stats stats_delta;
 
@@ -1826,7 +1839,9 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
 
         if (command_type == UDL_CMD_WRITERLX16) {
             udl_sink_clear_damage(&command_damage);
-            udl_transport_record_command_type(&stats_delta, command_type);
+            if (collect_detailed_stats) {
+                udl_transport_record_command_type(&stats_delta, command_type);
+            }
             parse_result = udl_transport_decode_writerlx16(transport,
                                                            pending,
                                                            pending_len,
@@ -1842,7 +1857,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
             }
 
             stats_delta.decoded_commands += 1u;
-            if (!command_damage.touched) {
+            if (collect_detailed_stats && !command_damage.touched) {
                 stats_delta.no_damage_commands += 1u;
             }
             udl_sink_merge_damage(damage, &command_damage);
@@ -1863,8 +1878,10 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         }
 
         udl_sink_clear_damage(&command_damage);
-        udl_transport_record_command_type(&stats_delta, command_type);
-        if (command_type == UDL_CMD_WRITEREG && command_len >= 4u) {
+        if (collect_detailed_stats) {
+            udl_transport_record_command_type(&stats_delta, command_type);
+        }
+        if (collect_detailed_stats && command_type == UDL_CMD_WRITEREG && command_len >= 4u) {
             const uint8_t reg = pending[2];
             const uint8_t value = pending[3];
 
@@ -1889,7 +1906,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         }
 
         stats_delta.decoded_commands += 1u;
-        if (!command_damage.touched) {
+        if (collect_detailed_stats && !command_damage.touched) {
             stats_delta.no_damage_commands += 1u;
         }
         udl_sink_merge_damage(damage, &command_damage);
