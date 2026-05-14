@@ -44,6 +44,10 @@ static enum udl_sink_result udl_sink_map_range(const struct udl_sink *sink,
                                                uint32_t byte_address,
                                                uint32_t pixel_count,
                                                uint32_t *first_pixel_out);
+static void udl_sink_write_plane16(struct udl_sink *sink,
+                                   uint32_t pixel_index,
+                                   uint16_t pixel,
+                                   struct udl_sink_damage *damage);
 static void udl_sink_mark_pixel(struct udl_sink_damage *damage,
                                 uint32_t x,
                                 uint32_t y);
@@ -227,6 +231,11 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
     const uint32_t byte_address = udl_sink_read_addr24(&command[2]);
     const uint32_t total_pixels = udl_sink_count_from_byte(command[5]);
     struct udl_sink *sink = transport->sink;
+    uint64_t raw_spans = 0u;
+    uint64_t raw_pixels = 0u;
+    uint64_t raw_single_pixel_spans = 0u;
+    uint64_t repeat_spans = 0u;
+    uint64_t repeat_pixels = 0u;
     uint32_t first_pixel;
     uint32_t produced = 0u;
     size_t offset = 6u;
@@ -261,10 +270,10 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
             return UDL_STREAM_PARSE_INVALID;
         }
 
-        transport->stats.writerlx16_raw_spans += 1u;
-        transport->stats.writerlx16_raw_pixels += raw_count;
+        raw_spans += 1u;
+        raw_pixels += raw_count;
         if (raw_count == 1u) {
-            transport->stats.writerlx16_raw_single_pixel_spans += 1u;
+            raw_single_pixel_spans += 1u;
         }
 
         raw_bytes = (size_t)raw_count * 2u;
@@ -282,11 +291,18 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
         offset += raw_bytes;
 
         if (produced + raw_count == total_pixels) {
-            udl_sink_blit_plane16_be(sink,
-                                     first_pixel + produced,
-                                     raw_data,
-                                     raw_count,
-                                     damage);
+            if (raw_count == 1u) {
+                udl_sink_write_plane16(sink,
+                                       first_pixel + produced,
+                                       raw_first_pixel16,
+                                       damage);
+            } else {
+                udl_sink_blit_plane16_be(sink,
+                                         first_pixel + produced,
+                                         raw_data,
+                                         raw_count,
+                                         damage);
+            }
             produced += raw_count;
             break;
         }
@@ -303,8 +319,8 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
                 return UDL_STREAM_PARSE_INVALID;
             }
 
-            transport->stats.writerlx16_repeat_spans += 1u;
-            transport->stats.writerlx16_repeat_pixels += repeat_count;
+            repeat_spans += 1u;
+            repeat_pixels += repeat_count;
 
             if (raw_count == 1u && raw_first_pixel16 == repeated_pixel16) {
                 udl_sink_fill_plane16(sink,
@@ -313,6 +329,22 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
                                       repeated_pixel16,
                                       damage);
                 produced += repeat_count + 1u;
+                continue;
+            }
+
+            if (raw_count == 1u) {
+                udl_sink_write_plane16(sink,
+                                       first_pixel + produced,
+                                       raw_first_pixel16,
+                                       damage);
+                produced += 1u;
+
+                udl_sink_fill_plane16(sink,
+                                      first_pixel + produced,
+                                      repeat_count,
+                                      repeated_pixel16,
+                                      damage);
+                produced += repeat_count;
                 continue;
             }
 
@@ -331,6 +363,12 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
             produced += repeat_count;
         }
     }
+
+    transport->stats.writerlx16_raw_spans += raw_spans;
+    transport->stats.writerlx16_raw_pixels += raw_pixels;
+    transport->stats.writerlx16_raw_single_pixel_spans += raw_single_pixel_spans;
+    transport->stats.writerlx16_repeat_spans += repeat_spans;
+    transport->stats.writerlx16_repeat_pixels += repeat_pixels;
 
     *command_len_out = offset;
     return UDL_STREAM_PARSE_COMPLETE;
@@ -434,17 +472,21 @@ static enum udl_transport_result udl_transport_reserve_pending(struct udl_transp
     return UDL_TRANSPORT_OK;
 }
 
-static void udl_transport_consume(struct udl_transport *transport, size_t count)
+static void udl_transport_compact_pending(struct udl_transport *transport, size_t consumed)
 {
-    if (count >= transport->pending_len) {
+    if (consumed >= transport->pending_len) {
         transport->pending_len = 0u;
         return;
     }
 
+    if (consumed == 0u) {
+        return;
+    }
+
     memmove(transport->pending,
-            transport->pending + count,
-            transport->pending_len - count);
-    transport->pending_len -= count;
+            transport->pending + consumed,
+            transport->pending_len - consumed);
+    transport->pending_len -= consumed;
 }
 
 static uint32_t udl_sink_plane_bytes_per_pixel(enum udl_sink_plane plane)
@@ -1559,6 +1601,10 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
 {
     enum udl_transport_result reserve_result;
     enum udl_sink_result sink_result;
+    size_t offset = 0u;
+    struct udl_transport_stats stats_delta;
+
+    memset(&stats_delta, 0, sizeof(stats_delta));
 
     if (!transport || !transport->sink) {
         return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
@@ -1604,8 +1650,10 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
     memcpy(transport->pending + transport->pending_len, buffer, length);
     transport->pending_len += length;
 
-    while (transport->pending_len > 0u) {
+    while (offset < transport->pending_len) {
         uint8_t *sync;
+        uint8_t *pending = transport->pending + offset;
+        size_t pending_len = transport->pending_len - offset;
         size_t command_len = 0u;
         size_t consumed = 0u;
         uint8_t command_type = 0u;
@@ -1613,100 +1661,121 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         struct udl_sink_damage command_damage;
         enum udl_sink_result decode_result;
 
-        sync = memchr(transport->pending, UDL_MSG_BULK, transport->pending_len);
-        if (!sync) {
-            transport->stats.dropped_bytes += transport->pending_len;
-            transport->pending_len = 0u;
+        if (pending[0] != UDL_MSG_BULK) {
+            sync = memchr(pending, UDL_MSG_BULK, pending_len);
+            if (!sync) {
+                stats_delta.dropped_bytes += pending_len;
+                offset = transport->pending_len;
+                break;
+            }
+
+            {
+                const size_t skipped = (size_t)(sync - pending);
+
+                stats_delta.dropped_bytes += skipped;
+                offset += skipped;
+                pending = transport->pending + offset;
+                pending_len = transport->pending_len - offset;
+            }
+        }
+
+        if (pending_len < 2u) {
             break;
         }
-        if (sync != transport->pending) {
-            size_t skipped = (size_t)(sync - transport->pending);
-
-            transport->stats.dropped_bytes += skipped;
-            udl_transport_consume(transport, skipped);
-        }
-
-        if (transport->pending_len < 2u) {
-            break;
-        }
-        if (transport->pending[1] == UDL_MSG_BULK) {
-            udl_transport_consume(transport, 1u);
+        if (pending[1] == UDL_MSG_BULK) {
+            offset += 1u;
             continue;
         }
 
-        command_type = transport->pending[1];
+        command_type = pending[1];
 
         if (command_type == UDL_CMD_WRITERLX16) {
             udl_sink_clear_damage(&command_damage);
-            udl_transport_record_command_type(&transport->stats, command_type);
+            udl_transport_record_command_type(&stats_delta, command_type);
             parse_result = udl_transport_decode_writerlx16(transport,
-                                                           transport->pending,
-                                                           transport->pending_len,
+                                                           pending,
+                                                           pending_len,
                                                            &command_damage,
                                                            &command_len);
             if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
                 break;
             }
             if (parse_result == UDL_STREAM_PARSE_INVALID) {
-                transport->stats.decode_errors += 1u;
-                udl_transport_consume(transport, 1u);
+                stats_delta.decode_errors += 1u;
+                offset += 1u;
                 continue;
             }
 
-            transport->stats.decoded_commands += 1u;
+            stats_delta.decoded_commands += 1u;
             if (!command_damage.touched) {
-                transport->stats.no_damage_commands += 1u;
+                stats_delta.no_damage_commands += 1u;
             }
             udl_sink_merge_damage(damage, &command_damage);
-            udl_transport_consume(transport, command_len);
+            offset += command_len;
             continue;
         } else {
-            parse_result = udl_transport_next_command_length(transport->pending,
-                                                             transport->pending_len,
+            parse_result = udl_transport_next_command_length(pending,
+                                                             pending_len,
                                                              &command_len);
         }
         if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
             break;
         }
         if (parse_result == UDL_STREAM_PARSE_INVALID) {
-            transport->stats.decode_errors += 1u;
-            udl_transport_consume(transport, 1u);
+            stats_delta.decode_errors += 1u;
+            offset += 1u;
             continue;
         }
 
         udl_sink_clear_damage(&command_damage);
-        udl_transport_record_command_type(&transport->stats, command_type);
+        udl_transport_record_command_type(&stats_delta, command_type);
         if (command_type == UDL_CMD_WRITEREG && command_len >= 4u) {
-            const uint8_t reg = transport->pending[2];
-            const uint8_t value = transport->pending[3];
+            const uint8_t reg = pending[2];
+            const uint8_t value = pending[3];
 
             if (transport->sink->registers[reg] == value) {
-                transport->stats.writereg_redundant_commands += 1u;
+                stats_delta.writereg_redundant_commands += 1u;
             }
         }
         decode_result = udl_sink_decode_command(transport->sink,
-                                                transport->pending,
+                                                pending,
                                                 command_len,
                                                 &consumed,
                                                 &command_damage);
         if (decode_result != UDL_SINK_OK) {
-            transport->stats.decode_errors += 1u;
-            udl_transport_consume(transport, command_len);
+            stats_delta.decode_errors += 1u;
+            offset += command_len;
             continue;
         }
         if (consumed != command_len) {
-            transport->stats.decode_errors += 1u;
-            udl_transport_consume(transport, command_len);
+            stats_delta.decode_errors += 1u;
+            offset += command_len;
             continue;
         }
 
-        transport->stats.decoded_commands += 1u;
+        stats_delta.decoded_commands += 1u;
         if (!command_damage.touched) {
-            transport->stats.no_damage_commands += 1u;
+            stats_delta.no_damage_commands += 1u;
         }
         udl_sink_merge_damage(damage, &command_damage);
-        udl_transport_consume(transport, command_len);
+        offset += command_len;
     }
+
+    udl_transport_compact_pending(transport, offset);
+    transport->stats.decoded_commands += stats_delta.decoded_commands;
+    transport->stats.decode_errors += stats_delta.decode_errors;
+    transport->stats.dropped_bytes += stats_delta.dropped_bytes;
+    transport->stats.writereg_commands += stats_delta.writereg_commands;
+    transport->stats.writereg_redundant_commands += stats_delta.writereg_redundant_commands;
+    transport->stats.writeraw8_commands += stats_delta.writeraw8_commands;
+    transport->stats.writerl8_commands += stats_delta.writerl8_commands;
+    transport->stats.writecopy8_commands += stats_delta.writecopy8_commands;
+    transport->stats.writerlx8_commands += stats_delta.writerlx8_commands;
+    transport->stats.writeraw16_commands += stats_delta.writeraw16_commands;
+    transport->stats.writerl16_commands += stats_delta.writerl16_commands;
+    transport->stats.writecopy16_commands += stats_delta.writecopy16_commands;
+    transport->stats.writerlx16_commands += stats_delta.writerlx16_commands;
+    transport->stats.no_damage_commands += stats_delta.no_damage_commands;
 
     return UDL_TRANSPORT_OK;
 }
