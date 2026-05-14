@@ -99,9 +99,7 @@ static size_t encode_reference_writerlx16(const uint16_t *pixels,
             *cmd++ = encode_count_byte((uint32_t)(pixel - run_start) - 1u);
 
             raw_pixel_start = pixel;
-            if ((uint32_t)(pixel - pixels) < pixel_count) {
-                raw_pixels_count_byte = cmd++;
-            }
+            raw_pixels_count_byte = cmd++;
         }
     }
 
@@ -361,6 +359,38 @@ static void test_reference_roundtrip_rgb565_surface(void)
     assert(damage.x2 == width);
     assert(damage.y2 == height);
     assert(damage.pixel_count == width * height);
+    udl_sink_destroy(&sink);
+}
+
+static void test_reference_roundtrip_repeat_only_rgb565_surface(void)
+{
+    uint16_t source[16];
+    uint16_t decoded[16] = {0};
+    uint8_t packet[64] = {0};
+    struct udl_sink sink;
+    struct udl_sink_damage damage;
+    const uint16_t pixel = 0x39e7u;
+    size_t packet_size;
+    uint32_t index;
+
+    for (index = 0u; index < 16u; ++index) {
+        source[index] = pixel;
+    }
+
+    packet_size = encode_reference_writerlx16(source, 16u, 0u, packet);
+
+    udl_sink_init(&sink, decoded, 16u, 1u, 16u);
+    udl_sink_clear_damage(&damage);
+
+    assert(udl_sink_decode_buffer(&sink, packet, packet_size, &damage) == UDL_SINK_OK);
+    assert(memcmp(source, decoded, sizeof(source)) == 0);
+    assert(damage.touched);
+    assert(damage.x1 == 0u);
+    assert(damage.y1 == 0u);
+    assert(damage.x2 == 16u);
+    assert(damage.y2 == 1u);
+    assert(damage.pixel_count == 16u);
+
     udl_sink_destroy(&sink);
 }
 
@@ -689,6 +719,7 @@ int main(void)
     test_writereg_and_writecopy16_track_state();
     test_invalid_command_returns_error();
     test_reference_roundtrip_rgb565_surface();
+    test_reference_roundtrip_repeat_only_rgb565_surface();
     test_24bpp_raw8_base_offsets_compose_xrgb8888();
     test_writerl8_and_writecopy8_compose_xrgb8888();
     test_writerlx8_compose_xrgb8888();

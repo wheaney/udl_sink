@@ -63,9 +63,7 @@ static size_t encode_reference_writerlx16(const uint16_t *pixels,
             *cmd++ = encode_count_byte((uint32_t)(pixel - run_start) - 1u);
 
             raw_pixel_start = pixel;
-            if ((uint32_t)(pixel - pixels) < pixel_count) {
-                raw_pixels_count_byte = cmd++;
-            }
+            raw_pixels_count_byte = cmd++;
         }
     }
 
