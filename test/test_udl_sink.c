@@ -523,6 +523,11 @@ static void test_transport_split_writerlx16_stats_commit_once(void)
 
     assert(udl_transport_feed(&transport, packet + 9u, sizeof(packet) - 9u, &damage) == UDL_TRANSPORT_OK);
     assert(damage.touched);
+    assert(framebuffer[0] == 0x1111u);
+    assert(framebuffer[1] == 0x2222u);
+    assert(framebuffer[2] == 0x3333u);
+    assert(framebuffer[3] == 0x3333u);
+    assert(framebuffer[4] == 0x3333u);
     stats = udl_transport_get_stats(&transport);
     assert(stats.decoded_commands == 1u);
     assert(stats.writerlx16_commands == 2u);
@@ -530,6 +535,37 @@ static void test_transport_split_writerlx16_stats_commit_once(void)
     assert(stats.writerlx16_repeat_spans == 1u);
     assert(stats.writerlx16_raw_pixels == 3u);
     assert(stats.writerlx16_repeat_pixels == 2u);
+    assert(stats.writerlx16_raw_single_pixel_spans == 0u);
+
+    udl_transport_destroy(&transport);
+    udl_sink_destroy(&sink);
+}
+
+static void test_transport_can_disable_writerlx16_span_stats(void)
+{
+    uint16_t framebuffer[8] = {0};
+    struct udl_sink sink;
+    struct udl_transport transport;
+    struct udl_sink_damage damage;
+    struct udl_transport_stats stats;
+    const uint8_t packet[] = {
+        0xaf, 0x6b, 0x00, 0x00, 0x00, 0x05, 0x03,
+        0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x02,
+        0xaf, 0xaf, 0xaf,
+    };
+
+    udl_sink_init(&sink, framebuffer, 8u, 1u, 8u);
+    udl_transport_init(&transport, &sink);
+    udl_transport_set_writerlx16_span_stats(&transport, false);
+
+    assert(udl_transport_feed(&transport, packet, sizeof(packet), &damage) == UDL_TRANSPORT_OK);
+    stats = udl_transport_get_stats(&transport);
+    assert(stats.decoded_commands == 1u);
+    assert(stats.writerlx16_commands == 1u);
+    assert(stats.writerlx16_raw_spans == 0u);
+    assert(stats.writerlx16_repeat_spans == 0u);
+    assert(stats.writerlx16_raw_pixels == 0u);
+    assert(stats.writerlx16_repeat_pixels == 0u);
     assert(stats.writerlx16_raw_single_pixel_spans == 0u);
 
     udl_transport_destroy(&transport);
@@ -584,6 +620,7 @@ int main(void)
     test_writerlx8_compose_xrgb8888();
     test_transport_reassembles_split_commands();
     test_transport_split_writerlx16_stats_commit_once();
+    test_transport_can_disable_writerlx16_span_stats();
     test_transport_drops_noise_and_recovers_from_invalid_framing();
     return 0;
 }

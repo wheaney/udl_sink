@@ -39,6 +39,9 @@ enum udl_sink_plane {
     UDL_SINK_PLANE_16,
 };
 
+static bool udl_sink_fast_path_16bpp_enabled(const struct udl_sink *sink);
+static uint32_t udl_sink_rgb565_to_xrgb8888_fast(const struct udl_sink *sink, uint16_t pixel16);
+static void udl_sink_mark_span(struct udl_sink_damage *damage, uint32_t x, uint32_t y, uint32_t length);
 static enum udl_sink_result udl_sink_map_range(const struct udl_sink *sink,
                                                enum udl_sink_plane plane,
                                                uint32_t byte_address,
@@ -80,6 +83,74 @@ static uint32_t udl_sink_read_addr24(const uint8_t *bytes)
     return ((uint32_t)bytes[0] << 16) |
            ((uint32_t)bytes[1] << 8) |
            (uint32_t)bytes[2];
+}
+
+static void udl_sink_blit_plane16_be_tiny(struct udl_sink *sink,
+                                          uint32_t first_pixel,
+                                          const uint8_t *src,
+                                          uint32_t pixel_count,
+                                          struct udl_sink_damage *damage)
+{
+    if (!udl_sink_fast_path_16bpp_enabled(sink)) {
+        uint32_t index;
+
+        for (index = 0u; index < pixel_count; ++index) {
+            udl_sink_write_plane16(sink,
+                                   first_pixel + index,
+                                   udl_sink_read_be16(&src[(size_t)index * 2u]),
+                                   damage);
+        }
+        return;
+    }
+
+    {
+        const uint32_t x = first_pixel % sink->width;
+        const uint32_t y = first_pixel / sink->width;
+        uint16_t *row_plane16 = sink->plane16 + first_pixel;
+        uint16_t *row_fb16 = sink->framebuffer
+            ? sink->framebuffer + ((size_t)y * sink->stride_pixels) + x
+            : NULL;
+        uint32_t *row_fb32 = sink->framebuffer_xrgb8888
+            ? sink->framebuffer_xrgb8888 + ((size_t)y * sink->stride_pixels_xrgb8888) + x
+            : NULL;
+        bool changed[4] = {false, false, false, false};
+        uint32_t index;
+
+        for (index = 0u; index < pixel_count; ++index) {
+            const uint16_t pixel = udl_sink_read_be16(&src[(size_t)index * 2u]);
+
+            if (row_plane16[index] == pixel) {
+                continue;
+            }
+
+            row_plane16[index] = pixel;
+            if (row_fb16) {
+                row_fb16[index] = pixel;
+            }
+            if (row_fb32) {
+                row_fb32[index] = udl_sink_rgb565_to_xrgb8888_fast(sink, pixel);
+            }
+
+            changed[index] = true;
+        }
+
+        index = 0u;
+        while (index < pixel_count) {
+            uint32_t run_start;
+
+            if (!changed[index]) {
+                index += 1u;
+                continue;
+            }
+
+            run_start = index;
+            do {
+                index += 1u;
+            } while (index < pixel_count && changed[index]);
+
+            udl_sink_mark_span(damage, x + run_start, y, index - run_start);
+        }
+    }
 }
 
 static uint32_t udl_sink_count_from_byte(uint8_t value)
@@ -230,6 +301,7 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
 {
     const uint32_t byte_address = udl_sink_read_addr24(&command[2]);
     const uint32_t total_pixels = udl_sink_count_from_byte(command[5]);
+    const bool collect_span_stats = transport->collect_writerlx16_span_stats;
     struct udl_sink *sink = transport->sink;
     uint64_t raw_spans = 0u;
     uint64_t raw_pixels = 0u;
@@ -270,10 +342,12 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
             return UDL_STREAM_PARSE_INVALID;
         }
 
-        raw_spans += 1u;
-        raw_pixels += raw_count;
-        if (raw_count == 1u) {
-            raw_single_pixel_spans += 1u;
+        if (collect_span_stats) {
+            raw_spans += 1u;
+            raw_pixels += raw_count;
+            if (raw_count == 1u) {
+                raw_single_pixel_spans += 1u;
+            }
         }
 
         raw_bytes = (size_t)raw_count * 2u;
@@ -291,11 +365,12 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
         offset += raw_bytes;
 
         if (produced + raw_count == total_pixels) {
-            if (raw_count == 1u) {
-                udl_sink_write_plane16(sink,
-                                       first_pixel + produced,
-                                       raw_first_pixel16,
-                                       damage);
+            if (raw_count <= 4u) {
+                udl_sink_blit_plane16_be_tiny(sink,
+                                              first_pixel + produced,
+                                              raw_data,
+                                              raw_count,
+                                              damage);
             } else {
                 udl_sink_blit_plane16_be(sink,
                                          first_pixel + produced,
@@ -319,8 +394,10 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
                 return UDL_STREAM_PARSE_INVALID;
             }
 
-            repeat_spans += 1u;
-            repeat_pixels += repeat_count;
+            if (collect_span_stats) {
+                repeat_spans += 1u;
+                repeat_pixels += repeat_count;
+            }
 
             if (raw_count == 1u && raw_first_pixel16 == repeated_pixel16) {
                 udl_sink_fill_plane16(sink,
@@ -332,12 +409,13 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
                 continue;
             }
 
-            if (raw_count == 1u) {
-                udl_sink_write_plane16(sink,
-                                       first_pixel + produced,
-                                       raw_first_pixel16,
-                                       damage);
-                produced += 1u;
+            if (raw_count <= 4u) {
+                udl_sink_blit_plane16_be_tiny(sink,
+                                              first_pixel + produced,
+                                              raw_data,
+                                              raw_count,
+                                              damage);
+                produced += raw_count;
 
                 udl_sink_fill_plane16(sink,
                                       first_pixel + produced,
@@ -364,11 +442,13 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
         }
     }
 
-    transport->stats.writerlx16_raw_spans += raw_spans;
-    transport->stats.writerlx16_raw_pixels += raw_pixels;
-    transport->stats.writerlx16_raw_single_pixel_spans += raw_single_pixel_spans;
-    transport->stats.writerlx16_repeat_spans += repeat_spans;
-    transport->stats.writerlx16_repeat_pixels += repeat_pixels;
+    if (collect_span_stats) {
+        transport->stats.writerlx16_raw_spans += raw_spans;
+        transport->stats.writerlx16_raw_pixels += raw_pixels;
+        transport->stats.writerlx16_raw_single_pixel_spans += raw_single_pixel_spans;
+        transport->stats.writerlx16_repeat_spans += repeat_spans;
+        transport->stats.writerlx16_repeat_pixels += repeat_pixels;
+    }
 
     *command_len_out = offset;
     return UDL_STREAM_PARSE_COMPLETE;
@@ -509,6 +589,35 @@ static uint16_t udl_sink_rgb888_to_rgb565(uint8_t red, uint8_t green, uint8_t bl
     return (uint16_t)(((uint16_t)(red & 0xf8u) << 8) |
                       ((uint16_t)(green & 0xfcu) << 3) |
                       ((uint16_t)blue >> 3));
+}
+
+static bool udl_sink_ensure_rgb565_lookup(struct udl_sink *sink)
+{
+    uint32_t *lookup;
+    uint32_t pixel;
+
+    if (!sink) {
+        return false;
+    }
+    if (sink->rgb565_to_xrgb8888_lookup) {
+        return true;
+    }
+
+    lookup = malloc(65536u * sizeof(*lookup));
+    if (!lookup) {
+        return false;
+    }
+
+    for (pixel = 0u; pixel <= 0xffffu; ++pixel) {
+        const uint8_t red = udl_sink_expand5_to8((uint8_t)((pixel >> 11) & 0x1fu));
+        const uint8_t green = udl_sink_expand6_to8((uint8_t)((pixel >> 5) & 0x3fu));
+        const uint8_t blue = udl_sink_expand5_to8((uint8_t)(pixel & 0x1fu));
+
+        lookup[pixel] = 0xff000000u | ((uint32_t)red << 16) | ((uint32_t)green << 8) | blue;
+    }
+
+    sink->rgb565_to_xrgb8888_lookup = lookup;
+    return true;
 }
 
 static uint32_t udl_sink_plane_base(const struct udl_sink *sink, enum udl_sink_plane plane)
@@ -754,6 +863,16 @@ static uint32_t udl_sink_rgb565_to_xrgb8888(uint16_t pixel16)
     return 0xff000000u | ((uint32_t)red << 16) | ((uint32_t)green << 8) | blue;
 }
 
+static uint32_t udl_sink_rgb565_to_xrgb8888_fast(const struct udl_sink *sink,
+                                                 uint16_t pixel16)
+{
+    if (sink && sink->rgb565_to_xrgb8888_lookup) {
+        return sink->rgb565_to_xrgb8888_lookup[pixel16];
+    }
+
+    return udl_sink_rgb565_to_xrgb8888(pixel16);
+}
+
 static void udl_sink_compose_all(struct udl_sink *sink, struct udl_sink_damage *damage)
 {
     uint32_t pixel_index;
@@ -812,7 +931,7 @@ static void udl_sink_store_plane16_fast_pixel(struct udl_sink *sink,
     }
     if (sink->framebuffer_xrgb8888) {
         sink->framebuffer_xrgb8888[(size_t)y * sink->stride_pixels_xrgb8888 + x] =
-            udl_sink_rgb565_to_xrgb8888(pixel);
+            udl_sink_rgb565_to_xrgb8888_fast(sink, pixel);
     }
 
     udl_sink_mark_pixel(damage, x, y);
@@ -968,7 +1087,7 @@ static void udl_sink_fill_plane16(struct udl_sink *sink,
 
     if (fast_path_16bpp) {
         const uint32_t width = sink->width;
-        const uint32_t xrgb8888 = udl_sink_rgb565_to_xrgb8888(pixel);
+        const uint32_t xrgb8888 = udl_sink_rgb565_to_xrgb8888_fast(sink, pixel);
         uint32_t remaining = pixel_count;
         uint32_t pixel_index = first_pixel;
 
@@ -1104,7 +1223,7 @@ static void udl_sink_blit_plane16_be(struct udl_sink *sink,
                             row_fb16[row_offset] = run_pixel;
                         }
                         if (row_fb32) {
-                            row_fb32[row_offset] = udl_sink_rgb565_to_xrgb8888(run_pixel);
+                            row_fb32[row_offset] = udl_sink_rgb565_to_xrgb8888_fast(sink, run_pixel);
                         }
 
                         row_offset += 1u;
@@ -1528,8 +1647,10 @@ void udl_sink_destroy(struct udl_sink *sink)
         return;
     }
 
+    free(sink->rgb565_to_xrgb8888_lookup);
     free(sink->plane16);
     free(sink->plane8);
+    sink->rgb565_to_xrgb8888_lookup = NULL;
     sink->plane16 = NULL;
     sink->plane8 = NULL;
     sink->plane_pixels = 0u;
@@ -1545,6 +1666,9 @@ void udl_sink_attach_xrgb8888_output(struct udl_sink *sink,
 
     sink->framebuffer_xrgb8888 = framebuffer;
     sink->stride_pixels_xrgb8888 = stride_pixels;
+    if (framebuffer) {
+        udl_sink_ensure_rgb565_lookup(sink);
+    }
 
     if (sink->plane16 && sink->plane8 && framebuffer) {
         udl_sink_compose_all(sink, NULL);
@@ -1569,6 +1693,17 @@ void udl_transport_init(struct udl_transport *transport,
 
     memset(transport, 0, sizeof(*transport));
     transport->sink = sink;
+    transport->collect_writerlx16_span_stats = true;
+}
+
+void udl_transport_set_writerlx16_span_stats(struct udl_transport *transport,
+                                             bool enabled)
+{
+    if (!transport) {
+        return;
+    }
+
+    transport->collect_writerlx16_span_stats = enabled;
 }
 
 void udl_transport_reset(struct udl_transport *transport)

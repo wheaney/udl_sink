@@ -128,6 +128,36 @@ static void fill_cursorish_pattern(uint16_t *pixels, uint32_t cursor_x)
     }
 }
 
+static void fill_short_raw_bridge_pattern(uint16_t *pixels,
+                                          uint16_t base,
+                                          uint32_t shift)
+{
+    uint32_t index = 0u;
+    uint32_t segment = 0u;
+
+    while (index < BENCH_PIXEL_COUNT) {
+        const uint32_t repeat_count = 7u + ((segment + shift) % 19u);
+        const uint32_t raw_count = 1u + ((segment + shift) % 4u);
+        uint32_t repeat_index;
+        uint32_t raw_index;
+        const uint16_t repeat_pixel = (uint16_t)(base + (uint16_t)(segment * 9u));
+
+        for (repeat_index = 0u;
+             repeat_index < repeat_count && index < BENCH_PIXEL_COUNT;
+             ++repeat_index, ++index) {
+            pixels[index] = repeat_pixel;
+        }
+
+        for (raw_index = 0u;
+             raw_index < raw_count && index < BENCH_PIXEL_COUNT;
+             ++raw_index, ++index) {
+            pixels[index] = (uint16_t)(repeat_pixel + 0x0020u + (uint16_t)(raw_index * 3u));
+        }
+
+        segment += 1u;
+    }
+}
+
 static void require_transport_ok(enum udl_transport_result result)
 {
     if (result != UDL_TRANSPORT_OK) {
@@ -201,6 +231,8 @@ int main(void)
     uint16_t repeat_b[BENCH_PIXEL_COUNT];
     uint16_t raw_a[BENCH_PIXEL_COUNT];
     uint16_t raw_b[BENCH_PIXEL_COUNT];
+    uint16_t short_raw_a[BENCH_PIXEL_COUNT];
+    uint16_t short_raw_b[BENCH_PIXEL_COUNT];
     uint16_t cursor_a[BENCH_PIXEL_COUNT];
     uint16_t cursor_b[BENCH_PIXEL_COUNT];
 
@@ -208,6 +240,8 @@ int main(void)
     fill_repeat_pattern(repeat_b, 0x7befu);
     fill_raw_pattern(raw_a, 0x0100u);
     fill_raw_pattern(raw_b, 0x2400u);
+    fill_short_raw_bridge_pattern(short_raw_a, 0x0841u, 0u);
+    fill_short_raw_bridge_pattern(short_raw_b, 0x1042u, 1u);
     fill_cursorish_pattern(cursor_a, 96u);
     fill_cursorish_pattern(cursor_b, 104u);
 
@@ -217,6 +251,7 @@ int main(void)
     run_case("repeat-changed", repeat_a, repeat_b, 1);
     run_case("raw-nodmg", raw_a, NULL, 0);
     run_case("raw-changed", raw_a, raw_b, 1);
+    run_case("short-raw-changed", short_raw_a, short_raw_b, 1);
     run_case("cursorish-changed", cursor_a, cursor_b, 1);
     return 0;
 }
