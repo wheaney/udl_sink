@@ -56,6 +56,9 @@ static void udl_sink_mark_pixel(struct udl_sink_damage *damage,
                                 uint32_t y);
 static uint32_t udl_sink_rgb565_to_xrgb8888(uint16_t pixel16);
 static size_t udl_sink_repeat_u16_word(uint16_t pixel);
+static bool udl_sink_plane16_span_matches_be(const uint16_t *dst,
+                                             const uint8_t *src,
+                                             uint32_t pixel_count);
 static void udl_sink_fill_plane16(struct udl_sink *sink,
                                   uint32_t first_pixel,
                                   uint32_t pixel_count,
@@ -366,7 +369,12 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
         offset += raw_bytes;
 
         if (produced + raw_count == total_pixels) {
-            if (raw_count <= 4u) {
+            if (raw_count == 1u) {
+                udl_sink_write_plane16(sink,
+                                       first_pixel + produced,
+                                       raw_first_pixel16,
+                                       damage);
+            } else if (raw_count <= 4u) {
                 udl_sink_blit_plane16_be_tiny(sink,
                                               first_pixel + produced,
                                               raw_data,
@@ -400,7 +408,7 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
                 repeat_pixels += repeat_count;
             }
 
-            if (raw_count == 1u && raw_first_pixel16 == repeated_pixel16) {
+            if (raw_count == 1u) {
                 udl_sink_fill_plane16(sink,
                                       first_pixel + produced,
                                       repeat_count + 1u,
@@ -410,36 +418,52 @@ static enum udl_stream_parse_result udl_transport_decode_writerlx16(struct udl_t
                 continue;
             }
 
-            if (raw_count <= 4u) {
-                udl_sink_blit_plane16_be_tiny(sink,
-                                              first_pixel + produced,
-                                              raw_data,
-                                              raw_count,
-                                              damage);
-                produced += raw_count;
+            if (raw_count == 2u) {
+                udl_sink_write_plane16(sink,
+                                       first_pixel + produced,
+                                       raw_first_pixel16,
+                                       damage);
+                produced += 1u;
 
                 udl_sink_fill_plane16(sink,
                                       first_pixel + produced,
-                                      repeat_count,
+                                      repeat_count + 1u,
                                       repeated_pixel16,
                                       damage);
-                produced += repeat_count;
+                produced += repeat_count + 1u;
+                continue;
+            }
+
+            if (raw_count <= 5u) {
+                udl_sink_blit_plane16_be_tiny(sink,
+                                              first_pixel + produced,
+                                              raw_data,
+                                              raw_count - 1u,
+                                              damage);
+                produced += raw_count - 1u;
+
+                udl_sink_fill_plane16(sink,
+                                      first_pixel + produced,
+                                      repeat_count + 1u,
+                                      repeated_pixel16,
+                                      damage);
+                produced += repeat_count + 1u;
                 continue;
             }
 
             udl_sink_blit_plane16_be(sink,
                                      first_pixel + produced,
                                      raw_data,
-                                     raw_count,
+                                     raw_count - 1u,
                                      damage);
-            produced += raw_count;
+            produced += raw_count - 1u;
 
             udl_sink_fill_plane16(sink,
                                   first_pixel + produced,
-                                  repeat_count,
+                                  repeat_count + 1u,
                                   repeated_pixel16,
                                   damage);
-            produced += repeat_count;
+            produced += repeat_count + 1u;
         }
     }
 
@@ -1008,6 +1032,74 @@ static bool udl_sink_plane16_span_all_equal(const uint16_t *pixels,
     return true;
 }
 
+static size_t udl_sink_swap_be16_word_to_host(size_t word)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if SIZE_MAX == UINT64_MAX
+    return ((word & (size_t)UINT64_C(0x00ff00ff00ff00ff)) << 8u) |
+           ((word & (size_t)UINT64_C(0xff00ff00ff00ff00)) >> 8u);
+#elif SIZE_MAX == UINT32_MAX
+    return ((word & (size_t)UINT32_C(0x00ff00ff)) << 8u) |
+           ((word & (size_t)UINT32_C(0xff00ff00)) >> 8u);
+#else
+    size_t swapped = 0u;
+    unsigned int shift;
+
+    for (shift = 0u; shift < (unsigned int)(sizeof(word) * 8u); shift += 16u) {
+        swapped |= ((word >> shift) & (size_t)0x00ffu) << (shift + 8u);
+        swapped |= ((word >> (shift + 8u)) & (size_t)0x00ffu) << shift;
+    }
+
+    return swapped;
+#endif
+#else
+    return word;
+#endif
+}
+
+static bool udl_sink_plane16_span_matches_be(const uint16_t *dst,
+                                             const uint8_t *src,
+                                             uint32_t pixel_count)
+{
+    const uint8_t *dst_bytes = (const uint8_t *)dst;
+    size_t remaining_bytes = (size_t)pixel_count * sizeof(*dst);
+    size_t offset = 0u;
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return memcmp(dst_bytes, src, remaining_bytes) == 0;
+#else
+    while (remaining_bytes >= sizeof(size_t)) {
+        size_t src_word;
+        size_t dst_word;
+
+        memcpy(&src_word, src + offset, sizeof(src_word));
+        memcpy(&dst_word, dst_bytes + offset, sizeof(dst_word));
+        if (udl_sink_swap_be16_word_to_host(src_word) != dst_word) {
+            return false;
+        }
+
+        offset += sizeof(size_t);
+        remaining_bytes -= sizeof(size_t);
+    }
+
+    while (remaining_bytes > 0u) {
+        uint16_t src_pixel;
+        uint16_t dst_pixel;
+
+        src_pixel = udl_sink_read_be16(src + offset);
+        memcpy(&dst_pixel, dst_bytes + offset, sizeof(dst_pixel));
+        if (dst_pixel != src_pixel) {
+            return false;
+        }
+
+        offset += sizeof(dst_pixel);
+        remaining_bytes -= sizeof(dst_pixel);
+    }
+
+    return true;
+#endif
+}
+
 static void udl_sink_fill_u16(uint16_t *dst,
                               uint32_t pixel_count,
                               uint16_t pixel)
@@ -1200,6 +1292,14 @@ static void udl_sink_blit_plane16_be(struct udl_sink *sink,
                 ? sink->framebuffer_xrgb8888 + ((size_t)y * sink->stride_pixels_xrgb8888) + x
                 : NULL;
             uint32_t row_offset = 0u;
+
+            if (row_pixels >= 8u &&
+                udl_sink_plane16_span_matches_be(row_plane16, row_src, row_pixels)) {
+                row_src += (size_t)row_pixels * 2u;
+                pixel_index += row_pixels;
+                remaining -= row_pixels;
+                continue;
+            }
 
             while (row_offset < row_pixels) {
                 const uint16_t pixel = udl_sink_read_be16(&row_src[(size_t)row_offset * 2u]);

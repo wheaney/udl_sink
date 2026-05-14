@@ -251,7 +251,9 @@ int main(void)
     run_case("repeat-changed", repeat_a, repeat_b, 1);
     run_case("raw-nodmg", raw_a, NULL, 0);
     run_case("raw-changed", raw_a, raw_b, 1);
+    run_case("short-raw-nodmg", short_raw_a, NULL, 0);
     run_case("short-raw-changed", short_raw_a, short_raw_b, 1);
+    run_case("cursorish-nodmg", cursor_a, NULL, 0);
     run_case("cursorish-changed", cursor_a, cursor_b, 1);
     return 0;
 }
