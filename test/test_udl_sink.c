@@ -206,6 +206,47 @@ static void test_writeraw16_and_writerl16_wrap_rows(void)
     udl_sink_destroy(&sink);
 }
 
+static void test_writeraw16_compose_xrgb8888_16bpp_noop(void)
+{
+    uint16_t framebuffer[4] = {0};
+    uint32_t xrgb8888[4] = {0};
+    struct udl_sink sink;
+    struct udl_sink_damage damage;
+    const uint8_t packet[] = {
+        0xaf, TEST_UDL_CMD_WRITERAW16, 0x00, 0x00, 0x00, 0x04,
+        0xf8, 0x00,
+        0x07, 0xe0,
+        0x00, 0x1f,
+        0xff, 0xff,
+    };
+
+    udl_sink_init(&sink, framebuffer, 4u, 1u, 4u);
+    udl_sink_attach_xrgb8888_output(&sink, xrgb8888, 4u);
+    udl_sink_clear_damage(&damage);
+
+    assert(udl_sink_decode_buffer(&sink, packet, sizeof(packet), &damage) == UDL_SINK_OK);
+    assert(framebuffer[0] == 0xf800u);
+    assert(framebuffer[1] == 0x07e0u);
+    assert(framebuffer[2] == 0x001fu);
+    assert(framebuffer[3] == 0xffffu);
+    assert(xrgb8888[0] == 0xffff0000u);
+    assert(xrgb8888[1] == 0xff00ff00u);
+    assert(xrgb8888[2] == 0xff0000ffu);
+    assert(xrgb8888[3] == 0xffffffffu);
+    assert(damage.touched);
+    assert(damage.x1 == 0u);
+    assert(damage.y1 == 0u);
+    assert(damage.x2 == 4u);
+    assert(damage.y2 == 1u);
+    assert(damage.pixel_count == 4u);
+
+    udl_sink_clear_damage(&damage);
+    assert(udl_sink_decode_buffer(&sink, packet, sizeof(packet), &damage) == UDL_SINK_OK);
+    assert(!damage.touched);
+
+    udl_sink_destroy(&sink);
+}
+
 static void test_writereg_and_writecopy16_track_state(void)
 {
     uint16_t framebuffer[8] = {0};
@@ -492,6 +533,7 @@ int main(void)
 {
     test_writerlx16_decodes_damage();
     test_writeraw16_and_writerl16_wrap_rows();
+    test_writeraw16_compose_xrgb8888_16bpp_noop();
     test_writereg_and_writecopy16_track_state();
     test_invalid_command_returns_error();
     test_reference_roundtrip_rgb565_surface();

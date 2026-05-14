@@ -44,6 +44,11 @@ static enum udl_sink_result udl_sink_map_range(const struct udl_sink *sink,
                                                uint32_t byte_address,
                                                uint32_t pixel_count,
                                                uint32_t *first_pixel_out);
+static void udl_sink_mark_pixel(struct udl_sink_damage *damage,
+                                uint32_t x,
+                                uint32_t y);
+static uint32_t udl_sink_rgb565_to_xrgb8888(uint16_t pixel16);
+static size_t udl_sink_repeat_u16_word(uint16_t pixel);
 static void udl_sink_fill_plane16(struct udl_sink *sink,
                                   uint32_t first_pixel,
                                   uint32_t pixel_count,
@@ -746,12 +751,42 @@ static uint8_t udl_sink_read_plane8(const struct udl_sink *sink, uint32_t pixel_
     return sink->plane8[pixel_index];
 }
 
+static bool udl_sink_fast_path_16bpp_enabled(const struct udl_sink *sink)
+{
+    return udl_sink_get_color_depth(sink) != UDL_COLORDEPTH_24BPP;
+}
+
+static void udl_sink_store_plane16_fast_pixel(struct udl_sink *sink,
+                                              uint32_t pixel_index,
+                                              uint16_t pixel,
+                                              struct udl_sink_damage *damage)
+{
+    const uint32_t x = pixel_index % sink->width;
+    const uint32_t y = pixel_index / sink->width;
+
+    sink->plane16[pixel_index] = pixel;
+    if (sink->framebuffer) {
+        sink->framebuffer[(size_t)y * sink->stride_pixels + x] = pixel;
+    }
+    if (sink->framebuffer_xrgb8888) {
+        sink->framebuffer_xrgb8888[(size_t)y * sink->stride_pixels_xrgb8888 + x] =
+            udl_sink_rgb565_to_xrgb8888(pixel);
+    }
+
+    udl_sink_mark_pixel(damage, x, y);
+}
+
 static void udl_sink_write_plane16(struct udl_sink *sink,
                                    uint32_t pixel_index,
                                    uint16_t pixel,
                                    struct udl_sink_damage *damage)
 {
     if (sink->plane16[pixel_index] == pixel) {
+        return;
+    }
+
+    if (udl_sink_fast_path_16bpp_enabled(sink)) {
+        udl_sink_store_plane16_fast_pixel(sink, pixel_index, pixel, damage);
         return;
     }
 
@@ -776,27 +811,36 @@ static bool udl_sink_plane16_span_all_equal(const uint16_t *pixels,
                                             uint32_t pixel_count,
                                             uint16_t pixel)
 {
-    uint32_t index = 0u;
+    const uint8_t *bytes = (const uint8_t *)pixels;
+    size_t remaining_bytes = (size_t)pixel_count * sizeof(*pixels);
+    size_t offset = 0u;
 
-    while (index + 8u <= pixel_count) {
-        if (pixels[index] != pixel ||
-            pixels[index + 1u] != pixel ||
-            pixels[index + 2u] != pixel ||
-            pixels[index + 3u] != pixel ||
-            pixels[index + 4u] != pixel ||
-            pixels[index + 5u] != pixel ||
-            pixels[index + 6u] != pixel ||
-            pixels[index + 7u] != pixel) {
-            return false;
+    if (remaining_bytes >= sizeof(size_t)) {
+        const size_t repeated_pixel_word = udl_sink_repeat_u16_word(pixel);
+
+        while (remaining_bytes >= sizeof(size_t)) {
+            size_t word;
+
+            memcpy(&word, bytes + offset, sizeof(word));
+            if (word != repeated_pixel_word) {
+                return false;
+            }
+
+            offset += sizeof(word);
+            remaining_bytes -= sizeof(word);
         }
-        index += 8u;
     }
 
-    while (index < pixel_count) {
-        if (pixels[index] != pixel) {
+    while (remaining_bytes > 0u) {
+        uint16_t tail_pixel;
+
+        memcpy(&tail_pixel, bytes + offset, sizeof(tail_pixel));
+        if (tail_pixel != pixel) {
             return false;
         }
-        index += 1u;
+
+        offset += sizeof(tail_pixel);
+        remaining_bytes -= sizeof(tail_pixel);
     }
 
     return true;
@@ -824,6 +868,18 @@ static void udl_sink_fill_u16(uint16_t *dst,
         dst[index] = pixel;
         index += 1u;
     }
+}
+
+static size_t udl_sink_repeat_u16_word(uint16_t pixel)
+{
+    size_t word = 0u;
+    unsigned int shift;
+
+    for (shift = 0u; shift < (unsigned int)(sizeof(word) * 8u); shift += 16u) {
+        word |= (size_t)pixel << shift;
+    }
+
+    return word;
 }
 
 static void udl_sink_fill_u32(uint32_t *dst,
@@ -857,7 +913,7 @@ static void udl_sink_fill_plane16(struct udl_sink *sink,
                                   struct udl_sink_damage *damage)
 {
     uint16_t *dst = sink->plane16 + first_pixel;
-    const bool fast_path_16bpp = udl_sink_get_color_depth(sink) != UDL_COLORDEPTH_24BPP;
+    const bool fast_path_16bpp = udl_sink_fast_path_16bpp_enabled(sink);
     uint32_t i;
 
     if (pixel_count == 0u) {
@@ -961,7 +1017,68 @@ static void udl_sink_blit_plane16_be(struct udl_sink *sink,
                                      uint32_t pixel_count,
                                      struct udl_sink_damage *damage)
 {
+    const bool fast_path_16bpp = udl_sink_fast_path_16bpp_enabled(sink);
     uint32_t i;
+
+    if (fast_path_16bpp) {
+        const uint32_t width = sink->width;
+        uint32_t remaining = pixel_count;
+        uint32_t pixel_index = first_pixel;
+        const uint8_t *row_src = src;
+
+        while (remaining > 0u) {
+            const uint32_t x = pixel_index % width;
+            const uint32_t y = pixel_index / width;
+            const uint32_t row_pixels = (remaining < (width - x)) ? remaining : (width - x);
+            uint16_t *row_plane16 = sink->plane16 + pixel_index;
+            uint16_t *row_fb16 = sink->framebuffer
+                ? sink->framebuffer + ((size_t)y * sink->stride_pixels) + x
+                : NULL;
+            uint32_t *row_fb32 = sink->framebuffer_xrgb8888
+                ? sink->framebuffer_xrgb8888 + ((size_t)y * sink->stride_pixels_xrgb8888) + x
+                : NULL;
+            uint32_t row_offset = 0u;
+
+            while (row_offset < row_pixels) {
+                const uint16_t pixel = udl_sink_read_be16(&row_src[(size_t)row_offset * 2u]);
+
+                if (row_plane16[row_offset] == pixel) {
+                    row_offset += 1u;
+                    continue;
+                }
+
+                {
+                    const uint32_t run_start = row_offset;
+
+                    do {
+                        const uint16_t run_pixel = udl_sink_read_be16(&row_src[(size_t)row_offset * 2u]);
+
+                        if (row_plane16[row_offset] == run_pixel) {
+                            break;
+                        }
+
+                        row_plane16[row_offset] = run_pixel;
+                        if (row_fb16) {
+                            row_fb16[row_offset] = run_pixel;
+                        }
+                        if (row_fb32) {
+                            row_fb32[row_offset] = udl_sink_rgb565_to_xrgb8888(run_pixel);
+                        }
+
+                        row_offset += 1u;
+                    } while (row_offset < row_pixels);
+
+                    udl_sink_mark_span(damage, x + run_start, y, row_offset - run_start);
+                }
+            }
+
+            row_src += (size_t)row_pixels * 2u;
+            pixel_index += row_pixels;
+            remaining -= row_pixels;
+        }
+
+        return;
+    }
 
     for (i = 0; i < pixel_count; ++i) {
         const uint32_t pixel_index = first_pixel + i;
