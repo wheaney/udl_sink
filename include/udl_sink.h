@@ -25,6 +25,13 @@ enum udl_transport_result {
     UDL_TRANSPORT_ERR_NO_MEMORY,
 };
 
+enum udl_transport_resync_reason {
+    UDL_TRANSPORT_RESYNC_NONE = 0,
+    UDL_TRANSPORT_RESYNC_NON_BULK,
+    UDL_TRANSPORT_RESYNC_DOUBLE_BULK,
+    UDL_TRANSPORT_RESYNC_INVALID_COMMAND,
+};
+
 struct udl_sink_damage {
     bool touched;
     uint32_t x1;
@@ -75,8 +82,15 @@ struct udl_transport {
     uint8_t *pending;
     size_t pending_len;
     size_t pending_capacity;
+    size_t last_feed_pending_prefix_len;
+    size_t last_feed_first_resync_offset;
     bool collect_detailed_stats;
     bool collect_writerlx16_span_stats;
+    bool last_feed_first_resync_offset_valid;
+    bool writecomp_quarantine_active;
+    uint8_t writecomp_quarantine_noncomp_ok;
+    size_t writecomp_quarantine_budget;
+    enum udl_transport_resync_reason last_feed_first_resync_reason;
     struct udl_transport_stats stats;
 };
 
@@ -102,6 +116,8 @@ void udl_transport_set_detailed_stats(struct udl_transport *transport,
 
 void udl_transport_set_writerlx16_span_stats(struct udl_transport *transport,
                                              bool enabled);
+
+void udl_transport_set_writecomp_debug(bool enabled);
 
 void udl_transport_reset(struct udl_transport *transport);
 

@@ -14,6 +14,8 @@ enum {
     TEST_UDL_CMD_WRITERAW16 = 0x68u,
     TEST_UDL_CMD_WRITECOPY16 = 0x6au,
     TEST_UDL_CMD_WRITERLX16 = 0x6bu,
+    TEST_UDL_CMD_WRITECOMP8 = 0x70u,
+    TEST_UDL_CMD_WRITECOMP16 = 0x78u,
     TEST_UDL_MAX_COMMAND_PIXELS = 256u,
 };
 
@@ -57,6 +59,94 @@ static uint8_t rgb888_to_low323(uint32_t xrgb8888)
     return (uint8_t)(((red & 0x07u) << 5) |
                      ((green & 0x03u) << 3) |
                      (blue & 0x07u));
+}
+
+static const char *test_huffman_bits_for_small_diff(int16_t diff)
+{
+    switch (diff) {
+    case 0:
+        return "00";
+    case 1:
+        return "10100";
+    case -1:
+        return "11100";
+    default:
+        assert(!"unsupported compressed diff in test helper");
+        return "";
+    }
+}
+
+static size_t append_bits_lsb(uint8_t *buffer, size_t bit_offset, const char *bits)
+{
+    size_t index;
+
+    for (index = 0u; bits[index] != '\0'; ++index) {
+        if (bits[index] == '1') {
+            buffer[bit_offset / 8u] |= (uint8_t)(1u << (bit_offset % 8u));
+        }
+
+        bit_offset += 1u;
+    }
+
+    return bit_offset;
+}
+
+static size_t encode_reference_writecomp16_small(const uint16_t *pixels,
+                                                 uint32_t pixel_count,
+                                                 uint32_t device_byte_offset,
+                                                 uint8_t *buffer)
+{
+    uint16_t previous_pixel = 0u;
+    size_t bit_offset = 0u;
+    uint32_t index;
+
+    assert(pixel_count >= 1u);
+    assert(pixel_count <= TEST_UDL_MAX_COMMAND_PIXELS);
+
+    buffer[0] = TEST_UDL_MSG_BULK;
+    buffer[1] = TEST_UDL_CMD_WRITECOMP16;
+    buffer[2] = (uint8_t)(device_byte_offset >> 16);
+    buffer[3] = (uint8_t)(device_byte_offset >> 8);
+    buffer[4] = (uint8_t)device_byte_offset;
+    buffer[5] = encode_count_byte(pixel_count);
+
+    for (index = 0u; index < pixel_count; ++index) {
+        const int16_t diff = (int16_t)(pixels[index] - previous_pixel);
+
+        bit_offset = append_bits_lsb(&buffer[6], bit_offset, test_huffman_bits_for_small_diff(diff));
+        previous_pixel = pixels[index];
+    }
+
+    return 6u + ((bit_offset + 7u) / 8u);
+}
+
+static size_t encode_reference_writecomp8_small(const uint8_t *pixels,
+                                                uint32_t pixel_count,
+                                                uint32_t device_byte_offset,
+                                                uint8_t *buffer)
+{
+    uint8_t previous_pixel = 0u;
+    size_t bit_offset = 0u;
+    uint32_t index;
+
+    assert(pixel_count >= 1u);
+    assert(pixel_count <= TEST_UDL_MAX_COMMAND_PIXELS);
+
+    buffer[0] = TEST_UDL_MSG_BULK;
+    buffer[1] = TEST_UDL_CMD_WRITECOMP8;
+    buffer[2] = (uint8_t)(device_byte_offset >> 16);
+    buffer[3] = (uint8_t)(device_byte_offset >> 8);
+    buffer[4] = (uint8_t)device_byte_offset;
+    buffer[5] = encode_count_byte(pixel_count);
+
+    for (index = 0u; index < pixel_count; ++index) {
+        const int16_t diff = (int16_t)pixels[index] - (int16_t)previous_pixel;
+
+        bit_offset = append_bits_lsb(&buffer[6], bit_offset, test_huffman_bits_for_small_diff(diff));
+        previous_pixel = pixels[index];
+    }
+
+    return 6u + ((bit_offset + 7u) / 8u);
 }
 
 static size_t encode_reference_writerlx16(const uint16_t *pixels,
@@ -184,7 +274,7 @@ static void test_writeraw16_and_writerl16_wrap_rows(void)
     struct udl_sink_damage damage;
     const uint8_t packet[] = {
         0xaf, 0x68, 0x00, 0x00, 0x02, 0x02, 0x12, 0x34, 0x56, 0x78,
-        0xaf, 0x69, 0x00, 0x00, 0x06, 0x02, 0x9a, 0xbc,
+        0xaf, 0x69, 0x00, 0x00, 0x06, 0x02, 0x02, 0x9a, 0xbc,
     };
 
     udl_sink_init(&sink, framebuffer, 4u, 2u, 4u);
@@ -328,6 +418,41 @@ static void test_invalid_command_returns_error(void)
     udl_sink_destroy(&sink);
 }
 
+static void test_transport_reassembles_split_writecomp16(void)
+{
+    const uint16_t expected[4] = {0x0001u, 0x0001u, 0x0002u, 0x0001u};
+    uint16_t framebuffer[4] = {0};
+    uint8_t packet[32] = {0};
+    struct udl_sink sink;
+    struct udl_transport transport;
+    struct udl_sink_damage damage;
+    struct udl_transport_stats stats;
+    const size_t packet_size = encode_reference_writecomp16_small(expected, 4u, 0u, packet);
+
+    udl_sink_init(&sink, framebuffer, 4u, 1u, 4u);
+    udl_transport_init(&transport, &sink);
+
+    assert(udl_transport_feed(&transport, packet, 7u, &damage) == UDL_TRANSPORT_OK);
+    assert(!damage.touched);
+
+    assert(udl_transport_feed(&transport, packet + 7u, packet_size - 7u, &damage) == UDL_TRANSPORT_OK);
+    assert(memcmp(expected, framebuffer, sizeof(expected)) == 0);
+    assert(damage.touched);
+    assert(damage.x1 == 0u);
+    assert(damage.y1 == 0u);
+    assert(damage.x2 == 4u);
+    assert(damage.y2 == 1u);
+    assert(damage.pixel_count == 4u);
+
+    stats = udl_transport_get_stats(&transport);
+    assert(stats.decoded_commands == 1u);
+    assert(stats.decode_errors == 0u);
+    assert(stats.dropped_bytes == 0u);
+
+    udl_transport_destroy(&transport);
+    udl_sink_destroy(&sink);
+}
+
 static void test_reference_roundtrip_rgb565_surface(void)
 {
     const uint32_t width = 9u;
@@ -454,8 +579,8 @@ static void test_writerl8_and_writecopy8_compose_xrgb8888(void)
         0xaf, 0x20, 0x26, 0x00,
         0xaf, 0x20, 0x27, 0x00,
         0xaf, 0x20, 0x28, 0x08,
-        0xaf, 0x69, 0x00, 0x00, 0x00, 0x04, (uint8_t)(high565 >> 8), (uint8_t)high565,
-        0xaf, TEST_UDL_CMD_WRITERL8, 0x00, 0x00, 0x08, 0x02, low323,
+        0xaf, 0x69, 0x00, 0x00, 0x00, 0x04, 0x04, (uint8_t)(high565 >> 8), (uint8_t)high565,
+        0xaf, TEST_UDL_CMD_WRITERL8, 0x00, 0x00, 0x08, 0x02, 0x02, low323,
         0xaf, TEST_UDL_CMD_WRITECOPY8, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x0a,
     };
     uint32_t index;
@@ -496,7 +621,7 @@ static void test_writerlx8_compose_xrgb8888(void)
         0xaf, 0x20, 0x26, 0x00,
         0xaf, 0x20, 0x27, 0x00,
         0xaf, 0x20, 0x28, 0x06,
-        0xaf, 0x69, 0x00, 0x00, 0x00, 0x03, (uint8_t)(high565 >> 8), (uint8_t)high565,
+        0xaf, 0x69, 0x00, 0x00, 0x00, 0x03, 0x03, (uint8_t)(high565 >> 8), (uint8_t)high565,
         0xaf, TEST_UDL_CMD_WRITERLX8, 0x00, 0x00, 0x06, 0x03, 0x02, low0, low1, 0x01,
     };
 
@@ -528,7 +653,7 @@ static void test_transport_reassembles_split_commands(void)
     struct udl_transport_stats stats;
     const uint8_t packet[] = {
         0xaf, 0x68, 0x00, 0x00, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78,
-        0xaf, 0x69, 0x00, 0x00, 0x04, 0x02, 0x9a, 0xbc,
+        0xaf, 0x69, 0x00, 0x00, 0x04, 0x02, 0x02, 0x9a, 0xbc,
     };
 
     udl_sink_init(&sink, framebuffer, 4u, 1u, 4u);
@@ -555,6 +680,96 @@ static void test_transport_reassembles_split_commands(void)
     assert(stats.dropped_bytes == 0u);
 
     udl_transport_destroy(&transport);
+    udl_sink_destroy(&sink);
+}
+
+static void test_24bpp_writecomp8_compose_xrgb8888(void)
+{
+    uint16_t framebuffer[2] = {0};
+    uint32_t xrgb8888[2] = {0};
+    uint8_t packet[32] = {0};
+    const uint8_t low_pixels[2] = {0x01u, 0x01u};
+    struct udl_sink sink;
+    struct udl_sink_damage damage;
+    size_t packet_size = 0u;
+
+    packet[packet_size++] = TEST_UDL_MSG_BULK;
+    packet[packet_size++] = 0x20u;
+    packet[packet_size++] = 0x00u;
+    packet[packet_size++] = 0x01u;
+    packet_size += encode_reference_writecomp8_small(low_pixels, 2u, 0u, packet + packet_size);
+
+    udl_sink_init(&sink, framebuffer, 2u, 1u, 2u);
+    udl_sink_attach_xrgb8888_output(&sink, xrgb8888, 2u);
+    udl_sink_clear_damage(&damage);
+
+    assert(udl_sink_decode_buffer(&sink, packet, packet_size, &damage) == UDL_SINK_OK);
+    assert(framebuffer[0] == 0x0000u);
+    assert(framebuffer[1] == 0x0000u);
+    assert(xrgb8888[0] == 0xff000001u);
+    assert(xrgb8888[1] == 0xff000001u);
+    assert(damage.touched);
+    assert(damage.x1 == 0u);
+    assert(damage.y1 == 0u);
+    assert(damage.x2 == 2u);
+    assert(damage.y2 == 1u);
+    assert(damage.pixel_count == 2u);
+
+    udl_sink_destroy(&sink);
+}
+
+static void test_writecomp16_out_of_range_is_consumed(void)
+{
+    uint16_t framebuffer[4] = {0};
+    uint8_t packet[32] = {0};
+    const uint16_t pixels[4] = {0x0001u, 0x0002u, 0x0001u, 0x0002u};
+    struct udl_sink sink;
+    struct udl_sink_damage damage;
+    const size_t packet_size = encode_reference_writecomp16_small(pixels,
+                                                                   4u,
+                                                                   0x000100u,
+                                                                   packet);
+
+    udl_sink_init(&sink, framebuffer, 4u, 1u, 4u);
+    udl_sink_clear_damage(&damage);
+
+    assert(udl_sink_decode_buffer(&sink, packet, packet_size, &damage) == UDL_SINK_OK);
+    assert(framebuffer[0] == 0u);
+    assert(framebuffer[1] == 0u);
+    assert(framebuffer[2] == 0u);
+    assert(framebuffer[3] == 0u);
+    assert(!damage.touched);
+
+    udl_sink_destroy(&sink);
+}
+
+static void test_writecomp16_partially_clips_to_visible_range(void)
+{
+    uint16_t framebuffer[4] = {0};
+    uint8_t packet[32] = {0};
+    const uint16_t pixels[4] = {0x0001u, 0x0002u, 0x0001u, 0x0002u};
+    struct udl_sink sink;
+    struct udl_sink_damage damage;
+    const size_t packet_size = encode_reference_writecomp16_small(pixels,
+                                                                   4u,
+                                                                   6u,
+                                                                   packet);
+
+    udl_sink_init(&sink, framebuffer, 4u, 1u, 4u);
+    udl_sink_clear_damage(&damage);
+
+    assert(udl_sink_decode_buffer(&sink, packet, packet_size, &damage) == UDL_SINK_OK);
+    assert(framebuffer[0] == 0u);
+    assert(framebuffer[1] == 0u);
+    assert(framebuffer[2] == 0u);
+    assert(framebuffer[3] == 0x0001u);
+    assert(damage.touched);
+    assert(damage.x1 == 3u);
+    assert(damage.y1 == 0u);
+    assert(damage.x2 == 4u);
+    assert(damage.y2 == 1u);
+    assert(damage.pixel_count == 1u);
+
     udl_sink_destroy(&sink);
 }
 
@@ -703,8 +918,8 @@ static void test_transport_drops_noise_and_recovers_from_invalid_framing(void)
 
     stats = udl_transport_get_stats(&transport);
     assert(stats.decoded_commands == 1u);
-    assert(stats.decode_errors == 1u);
-    assert(stats.dropped_bytes == 3u);
+    assert(stats.decode_errors == 0u);
+    assert(stats.dropped_bytes == 4u);
 
     udl_transport_destroy(&transport);
     udl_sink_destroy(&sink);
@@ -718,9 +933,13 @@ int main(void)
     test_writerlx16_raw_noop();
     test_writereg_and_writecopy16_track_state();
     test_invalid_command_returns_error();
+    test_transport_reassembles_split_writecomp16();
     test_reference_roundtrip_rgb565_surface();
     test_reference_roundtrip_repeat_only_rgb565_surface();
     test_24bpp_raw8_base_offsets_compose_xrgb8888();
+    test_24bpp_writecomp8_compose_xrgb8888();
+    test_writecomp16_out_of_range_is_consumed();
+    test_writecomp16_partially_clips_to_visible_range();
     test_writerl8_and_writecopy8_compose_xrgb8888();
     test_writerlx8_compose_xrgb8888();
     test_transport_reassembles_split_commands();

@@ -1,11 +1,16 @@
 #include "udl_sink.h"
+#include "udl_sink_huffman_table.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 enum {
     UDL_MSG_BULK = 0xafu,
     UDL_CMD_WRITEREG = 0x20u,
+    UDL_CMD_UNKNOWN_40 = 0x40u,
+    UDL_CMD_NOP_A0 = 0xa0u,
+    UDL_CMD_OPAQUE_E0 = 0xe0u,
     UDL_CMD_WRITERAW8 = 0x60u,
     UDL_CMD_WRITERL8 = 0x61u,
     UDL_CMD_WRITECOPY8 = 0x62u,
@@ -14,6 +19,8 @@ enum {
     UDL_CMD_WRITERL16 = 0x69u,
     UDL_CMD_WRITECOPY16 = 0x6au,
     UDL_CMD_WRITERLX16 = 0x6bu,
+    UDL_CMD_WRITECOMP8 = 0x70u,
+    UDL_CMD_WRITECOMP16 = 0x78u,
     UDL_REG_COLORDEPTH = 0x00u,
     UDL_COLORDEPTH_16BPP = 0u,
     UDL_COLORDEPTH_24BPP = 1u,
@@ -26,7 +33,67 @@ enum {
     UDL_REG_BASE8BPP_ADDR1 = 0x27u,
     UDL_REG_BASE8BPP_ADDR0 = 0x28u,
     UDL_MAX_COMMAND_PIXELS = 256u,
+    UDL_CMD_UNKNOWN_40_SIZE = 3u,
+    UDL_CMD_UNKNOWN_40_ARG = 0x0bu,
+    UDL_CMD_E0_HEADER_SIZE = 9u,
+    UDL_CMD_E0_RECORD_SIZE = 9u,
+    UDL_CMD_E0_RECORD_COUNT = 512u,
+    UDL_CMD_E0_TOTAL_SIZE = UDL_CMD_E0_HEADER_SIZE + (UDL_CMD_E0_RECORD_SIZE * UDL_CMD_E0_RECORD_COUNT),
+    UDL_CMD_E0_TRAILER_SIZE = 1u,
+    UDL_HUFFMAN_DIFF_OFFSET = 1 << 15,
+    UDL_HUFFMAN_CODE_COUNT = (UDL_HUFFMAN_DIFF_OFFSET * 2) + 1,
+    UDL_WRITECOMP_QUARANTINE_BYTES = 16384u,
+    UDL_WRITECOMP_QUARANTINE_NONCOMP_REQUIRED = 2u,
+    UDL_WRITECOMP_PROBE_PIXELS = 16u,
 };
+
+struct udl_huffman_code {
+    uint8_t size;
+    uint32_t bits;
+};
+
+struct udl_huffman_node {
+    uint32_t child[2];
+    int32_t diff;
+    bool leaf;
+};
+
+struct udl_huffman_tree {
+    struct udl_huffman_node *nodes;
+    size_t node_count;
+    size_t node_capacity;
+    bool ready;
+};
+
+struct udl_huffman_bitstream {
+    const uint8_t *bytes;
+    size_t byte_length;
+    size_t byte_offset;
+    uint8_t bit_offset;
+};
+
+static struct udl_huffman_tree udl_huffman_tree;
+static bool udl_sink_writecomp_debug_enabled = false;
+
+static size_t udl_transport_e0_command_length(const uint8_t *command, size_t length)
+{
+    if (!command || length < UDL_CMD_E0_TOTAL_SIZE) {
+        return 0u;
+    }
+
+    if (length == UDL_CMD_E0_TOTAL_SIZE + UDL_CMD_E0_TRAILER_SIZE &&
+        command[UDL_CMD_E0_TOTAL_SIZE] != UDL_MSG_BULK) {
+        return UDL_CMD_E0_TOTAL_SIZE + UDL_CMD_E0_TRAILER_SIZE;
+    }
+
+    if (length >= UDL_CMD_E0_TOTAL_SIZE + UDL_CMD_E0_TRAILER_SIZE + 1u &&
+        command[UDL_CMD_E0_TOTAL_SIZE] != UDL_MSG_BULK &&
+        command[UDL_CMD_E0_TOTAL_SIZE + UDL_CMD_E0_TRAILER_SIZE] == UDL_MSG_BULK) {
+        return UDL_CMD_E0_TOTAL_SIZE + UDL_CMD_E0_TRAILER_SIZE;
+    }
+
+    return UDL_CMD_E0_TOTAL_SIZE;
+}
 
 enum udl_stream_parse_result {
     UDL_STREAM_PARSE_COMPLETE,
@@ -38,6 +105,210 @@ enum udl_sink_plane {
     UDL_SINK_PLANE_8,
     UDL_SINK_PLANE_16,
 };
+
+static void udl_sink_huffman_init_node(struct udl_huffman_node *node)
+{
+    if (!node) {
+        return;
+    }
+
+    node->child[0] = UINT32_MAX;
+    node->child[1] = UINT32_MAX;
+    node->diff = 0;
+    node->leaf = false;
+}
+
+static bool udl_sink_huffman_reserve_nodes(struct udl_huffman_tree *tree,
+                                           size_t required)
+{
+    size_t new_capacity;
+    struct udl_huffman_node *new_nodes;
+
+    if (!tree) {
+        return false;
+    }
+
+    if (required <= tree->node_capacity) {
+        return true;
+    }
+
+    new_capacity = tree->node_capacity ? tree->node_capacity : 1024u;
+    while (new_capacity < required) {
+        if (new_capacity > SIZE_MAX / 2u) {
+            new_capacity = required;
+            break;
+        }
+
+        new_capacity *= 2u;
+    }
+
+    new_nodes = realloc(tree->nodes, new_capacity * sizeof(*new_nodes));
+    if (!new_nodes) {
+        return false;
+    }
+
+    tree->nodes = new_nodes;
+    while (tree->node_capacity < new_capacity) {
+        udl_sink_huffman_init_node(&tree->nodes[tree->node_capacity]);
+        tree->node_capacity += 1u;
+    }
+
+    return true;
+}
+
+static bool udl_sink_huffman_insert(struct udl_huffman_tree *tree,
+                                    uint32_t bits,
+                                    uint8_t size,
+                                    int32_t diff)
+{
+    uint32_t node_index = 0u;
+    uint8_t bit_index;
+
+    if (!tree || size == 0u) {
+        return false;
+    }
+
+    for (bit_index = 0u; bit_index < size; ++bit_index) {
+        const uint32_t bit = (bits >> bit_index) & 0x01u;
+        uint32_t next_index = tree->nodes[node_index].child[bit];
+
+        if (next_index == UINT32_MAX) {
+            next_index = (uint32_t)tree->node_count;
+            if (!udl_sink_huffman_reserve_nodes(tree, tree->node_count + 1u)) {
+                return false;
+            }
+
+            udl_sink_huffman_init_node(&tree->nodes[next_index]);
+            tree->nodes[node_index].child[bit] = next_index;
+            tree->node_count += 1u;
+        }
+
+        node_index = next_index;
+    }
+
+    if (tree->nodes[node_index].leaf) {
+        /* Tubecable's packed table contains a few alias codewords.
+         * Keep the first mapping so decoding remains deterministic. */
+        return true;
+    }
+
+    tree->nodes[node_index].leaf = true;
+    tree->nodes[node_index].diff = diff;
+    return true;
+}
+
+static bool udl_sink_huffman_ensure_tree(void)
+{
+    size_t index;
+
+    if (udl_huffman_tree.ready) {
+        return true;
+    }
+
+    if (!udl_sink_huffman_reserve_nodes(&udl_huffman_tree, 1u)) {
+        return false;
+    }
+
+    if (udl_huffman_tree.node_count == 0u) {
+        udl_sink_huffman_init_node(&udl_huffman_tree.nodes[0]);
+        udl_huffman_tree.node_count = 1u;
+    }
+
+    if ((size_t)udl_sink_huffman_table_len < (size_t)UDL_HUFFMAN_CODE_COUNT * 5u) {
+        return false;
+    }
+
+    for (index = 0u; index < UDL_HUFFMAN_CODE_COUNT; ++index) {
+        const uint8_t *entry = &udl_sink_huffman_table[index * 5u];
+        const uint8_t size = entry[0];
+        const uint32_t bits = ((uint32_t)entry[1] << 24) |
+                              ((uint32_t)entry[2] << 16) |
+                              ((uint32_t)entry[3] << 8) |
+                              (uint32_t)entry[4];
+        const int32_t diff = (int32_t)index - UDL_HUFFMAN_DIFF_OFFSET;
+
+        if (size == 0u) {
+            return false;
+        }
+
+        if (!udl_sink_huffman_insert(&udl_huffman_tree, bits, size, diff)) {
+            return false;
+        }
+    }
+
+    udl_huffman_tree.ready = true;
+    return true;
+}
+
+static size_t udl_sink_huffman_bytes_consumed(const struct udl_huffman_bitstream *bitstream)
+{
+    if (!bitstream) {
+        return 0u;
+    }
+
+    return bitstream->byte_offset + (bitstream->bit_offset != 0u ? 1u : 0u);
+}
+
+static enum udl_sink_result udl_sink_huffman_read_bit(struct udl_huffman_bitstream *bitstream,
+                                                      uint8_t *bit_out)
+{
+    uint8_t bit;
+
+    if (!bitstream || !bit_out) {
+        return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    if (bitstream->byte_offset >= bitstream->byte_length) {
+        return UDL_SINK_ERR_TRUNCATED_COMMAND;
+    }
+
+    bit = (uint8_t)((bitstream->bytes[bitstream->byte_offset] >> bitstream->bit_offset) & 0x01u);
+    bitstream->bit_offset += 1u;
+    if (bitstream->bit_offset == 8u) {
+        bitstream->bit_offset = 0u;
+        bitstream->byte_offset += 1u;
+    }
+
+    *bit_out = bit;
+    return UDL_SINK_OK;
+}
+
+static enum udl_sink_result udl_sink_huffman_read_diff(struct udl_huffman_bitstream *bitstream,
+                                                       int32_t *diff_out)
+{
+    uint32_t node_index = 0u;
+
+    if (!bitstream || !diff_out) {
+        return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    if (!udl_sink_huffman_ensure_tree()) {
+        return UDL_SINK_ERR_NO_MEMORY;
+    }
+
+    while (!udl_huffman_tree.nodes[node_index].leaf) {
+        uint8_t bit;
+        uint32_t next_index;
+
+        {
+            enum udl_sink_result bit_result = udl_sink_huffman_read_bit(bitstream, &bit);
+
+            if (bit_result != UDL_SINK_OK) {
+                return bit_result;
+            }
+        }
+
+        next_index = udl_huffman_tree.nodes[node_index].child[bit];
+        if (next_index == UINT32_MAX || next_index >= udl_huffman_tree.node_count) {
+            return UDL_SINK_ERR_INVALID_COMMAND;
+        }
+
+        node_index = next_index;
+    }
+
+    *diff_out = udl_huffman_tree.nodes[node_index].diff;
+    return UDL_SINK_OK;
+}
 
 static bool udl_sink_fast_path_16bpp_enabled(const struct udl_sink *sink);
 static uint32_t udl_sink_rgb565_to_xrgb8888_fast(const struct udl_sink *sink, uint16_t pixel16);
@@ -299,6 +570,385 @@ static void udl_transport_record_command_type(struct udl_transport_stats *stats,
     default:
         break;
     }
+}
+
+static bool udl_transport_is_framebuffer_command(uint8_t command_type)
+{
+    switch (command_type) {
+    case UDL_CMD_WRITERAW8:
+    case UDL_CMD_WRITERL8:
+    case UDL_CMD_WRITECOPY8:
+    case UDL_CMD_WRITERLX8:
+    case UDL_CMD_WRITERAW16:
+    case UDL_CMD_WRITERL16:
+    case UDL_CMD_WRITECOPY16:
+    case UDL_CMD_WRITERLX16:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool udl_transport_is_framebuffer_resync_command(uint8_t command_type)
+{
+    if (udl_transport_is_framebuffer_command(command_type)) {
+        return true;
+    }
+
+    return command_type == UDL_CMD_WRITECOMP8 ||
+           command_type == UDL_CMD_WRITECOMP16;
+}
+
+static bool udl_transport_is_known_command_type(uint8_t command_type)
+{
+    switch (command_type) {
+    case UDL_CMD_WRITEREG:
+    case UDL_CMD_UNKNOWN_40:
+    case UDL_CMD_NOP_A0:
+    case UDL_CMD_OPAQUE_E0:
+    case UDL_CMD_WRITERAW8:
+    case UDL_CMD_WRITERL8:
+    case UDL_CMD_WRITECOPY8:
+    case UDL_CMD_WRITERLX8:
+    case UDL_CMD_WRITERAW16:
+    case UDL_CMD_WRITERL16:
+    case UDL_CMD_WRITECOPY16:
+    case UDL_CMD_WRITERLX16:
+    case UDL_CMD_WRITECOMP8:
+    case UDL_CMD_WRITECOMP16:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static enum udl_stream_parse_result udl_transport_next_command_length(const uint8_t *command,
+                                                                      size_t length,
+                                                                      size_t *command_len_out);
+
+static enum udl_stream_parse_result udl_transport_probe_writecomp_candidate(const uint8_t *command,
+                                                                             size_t length)
+{
+    struct udl_huffman_bitstream bitstream;
+    uint32_t pixel_count;
+    uint32_t probe_pixels;
+    uint32_t index;
+
+    if (!command || length < 2u) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+    if (command[0] != UDL_MSG_BULK) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+    if (command[1] != UDL_CMD_WRITECOMP8 && command[1] != UDL_CMD_WRITECOMP16) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+    if (length < 7u) {
+        return UDL_STREAM_PARSE_NEED_MORE;
+    }
+
+    pixel_count = udl_sink_count_from_byte(command[5]);
+    if (pixel_count == 0u) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+
+    probe_pixels = pixel_count;
+    if (probe_pixels > UDL_WRITECOMP_PROBE_PIXELS) {
+        probe_pixels = UDL_WRITECOMP_PROBE_PIXELS;
+    }
+
+    bitstream.bytes = command + 6u;
+    bitstream.byte_length = length - 6u;
+    bitstream.byte_offset = 0u;
+    bitstream.bit_offset = 0u;
+
+    for (index = 0u; index < probe_pixels; ++index) {
+        uint8_t change = 0u;
+        enum udl_sink_result result = udl_sink_huffman_read_bit(&bitstream, &change);
+
+        if (result != UDL_SINK_OK) {
+            if (result == UDL_SINK_ERR_TRUNCATED_COMMAND) {
+                return UDL_STREAM_PARSE_NEED_MORE;
+            }
+            return UDL_STREAM_PARSE_INVALID;
+        }
+
+        if (change == 0u) {
+            continue;
+        }
+
+        {
+            int32_t diff = 0;
+
+            result = udl_sink_huffman_read_diff(&bitstream, &diff);
+            (void)diff;
+
+            if (result == UDL_SINK_OK) {
+                continue;
+            }
+            if (result == UDL_SINK_ERR_TRUNCATED_COMMAND) {
+                return UDL_STREAM_PARSE_NEED_MORE;
+            }
+            return UDL_STREAM_PARSE_INVALID;
+        }
+    }
+
+    return UDL_STREAM_PARSE_COMPLETE;
+}
+
+static enum udl_stream_parse_result udl_transport_probe_command_candidate(const uint8_t *command,
+                                                                          size_t length)
+{
+    size_t command_len = 0u;
+
+    if (!command || length < 2u || command[0] != UDL_MSG_BULK) {
+        return UDL_STREAM_PARSE_INVALID;
+    }
+
+    if (command[1] == UDL_CMD_WRITECOMP8 || command[1] == UDL_CMD_WRITECOMP16) {
+        return udl_transport_probe_writecomp_candidate(command, length);
+    }
+
+    return udl_transport_next_command_length(command, length, &command_len);
+}
+
+static bool udl_transport_find_next_command_mode(const uint8_t *buffer,
+                                                 size_t length,
+                                                 size_t *offset_out,
+                                                 bool *needs_more_out,
+                                                 bool allow_relaxed)
+{
+    size_t offset;
+    bool saw_partial = false;
+    size_t partial_offset = 0u;
+
+    if (!buffer || !offset_out || !needs_more_out) {
+        return false;
+    }
+
+    *needs_more_out = false;
+    *offset_out = 0u;
+
+    for (offset = 0u; offset < length; ++offset) {
+        if (buffer[offset] != UDL_MSG_BULK) {
+            continue;
+        }
+
+        if (offset + 1u >= length) {
+            *offset_out = offset;
+            *needs_more_out = true;
+            return false;
+        }
+
+        if (udl_transport_is_known_command_type(buffer[offset + 1u])) {
+            enum udl_stream_parse_result probe_result =
+                udl_transport_probe_command_candidate(buffer + offset, length - offset);
+
+            if (probe_result == UDL_STREAM_PARSE_COMPLETE) {
+                *offset_out = offset;
+                return true;
+            }
+
+            if (probe_result == UDL_STREAM_PARSE_NEED_MORE && !saw_partial) {
+                saw_partial = true;
+                partial_offset = offset;
+            }
+        }
+    }
+
+    if (allow_relaxed) {
+        /* Strict probing can reject some legitimate compressed starts when
+         * the stream has already drifted. As a recovery fallback, accept the
+         * next marker with a known opcode and let the decode path validate it.
+         */
+        for (offset = 0u; offset + 1u < length; ++offset) {
+            if (buffer[offset] == UDL_MSG_BULK &&
+                udl_transport_is_known_command_type(buffer[offset + 1u])) {
+                *offset_out = offset;
+                *needs_more_out = false;
+                return true;
+            }
+        }
+    }
+
+    if (saw_partial) {
+        *offset_out = partial_offset;
+        *needs_more_out = true;
+    }
+
+    return false;
+}
+
+/* Prefer a strong stream anchor when recovering from desync.
+ * `af 20 ff xx` is a common command-boundary marker (WRITEREG VIDREG).
+ */
+static bool udl_transport_find_next_register_anchor(const uint8_t *buffer,
+                                                    size_t length,
+                                                    size_t *offset_out,
+                                                    bool *needs_more_out)
+{
+    size_t offset;
+
+    if (!buffer || !offset_out || !needs_more_out) {
+        return false;
+    }
+
+    *offset_out = 0u;
+    *needs_more_out = false;
+
+    for (offset = 0u; offset < length; ++offset) {
+        size_t anchor_len = 0u;
+        enum udl_stream_parse_result parse_result;
+
+        if (buffer[offset] != UDL_MSG_BULK) {
+            continue;
+        }
+
+        if (offset + 1u >= length) {
+            *offset_out = offset;
+            *needs_more_out = true;
+            return false;
+        }
+
+        if (buffer[offset + 1u] != UDL_CMD_WRITEREG) {
+            continue;
+        }
+
+        if (offset + 4u > length) {
+            *offset_out = offset;
+            *needs_more_out = true;
+            return false;
+        }
+
+        if (buffer[offset + 2u] != 0xffu) {
+            continue;
+        }
+
+        parse_result = udl_transport_next_command_length(buffer + offset,
+                                                         length - offset,
+                                                         &anchor_len);
+        if (parse_result == UDL_STREAM_PARSE_COMPLETE && anchor_len == 4u) {
+            *offset_out = offset;
+            return true;
+        }
+        if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
+            *offset_out = offset;
+            *needs_more_out = true;
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static bool udl_transport_find_next_command(const uint8_t *buffer,
+                                            size_t length,
+                                            size_t *offset_out,
+                                            bool *needs_more_out)
+{
+    return udl_transport_find_next_command_mode(buffer,
+                                                length,
+                                                offset_out,
+                                                needs_more_out,
+                                                true);
+}
+
+static bool udl_transport_find_next_command_strict(const uint8_t *buffer,
+                                                   size_t length,
+                                                   size_t *offset_out,
+                                                   bool *needs_more_out)
+{
+    return udl_transport_find_next_command_mode(buffer,
+                                                length,
+                                                offset_out,
+                                                needs_more_out,
+                                                false);
+}
+
+static bool udl_transport_find_next_framebuffer_command_strict(const uint8_t *buffer,
+                                                               size_t length,
+                                                               size_t *offset_out,
+                                                               bool *needs_more_out)
+{
+    size_t offset;
+    bool saw_partial = false;
+    size_t partial_offset = 0u;
+
+    if (!buffer || !offset_out || !needs_more_out) {
+        return false;
+    }
+
+    *needs_more_out = false;
+    *offset_out = 0u;
+
+    for (offset = 0u; offset < length; ++offset) {
+        uint8_t command_type;
+        enum udl_stream_parse_result probe_result;
+
+        if (buffer[offset] != UDL_MSG_BULK) {
+            continue;
+        }
+        if (offset + 1u >= length) {
+            *offset_out = offset;
+            *needs_more_out = true;
+            return false;
+        }
+
+        command_type = buffer[offset + 1u];
+        if (!udl_transport_is_known_command_type(command_type) ||
+            !udl_transport_is_framebuffer_resync_command(command_type)) {
+            continue;
+        }
+
+        probe_result = udl_transport_probe_command_candidate(buffer + offset, length - offset);
+        if (probe_result == UDL_STREAM_PARSE_COMPLETE) {
+            *offset_out = offset;
+            return true;
+        }
+        if (probe_result == UDL_STREAM_PARSE_NEED_MORE && !saw_partial) {
+            saw_partial = true;
+            partial_offset = offset;
+        }
+    }
+
+    if (saw_partial) {
+        *offset_out = partial_offset;
+        *needs_more_out = true;
+    }
+
+    return false;
+}
+
+static enum udl_stream_parse_result udl_transport_parse_writerl_length(const uint8_t *command,
+                                                                       size_t length,
+                                                                       size_t bytes_per_pixel,
+                                                                       size_t *command_len_out)
+{
+    uint32_t produced = 0u;
+    const uint32_t total_pixels = udl_sink_count_from_byte(command[5]);
+    size_t offset = 6u;
+
+    if (length < 6u) {
+        return UDL_STREAM_PARSE_NEED_MORE;
+    }
+
+    while (produced < total_pixels) {
+        const uint32_t run_count = udl_sink_count_from_byte(command[offset]);
+
+        offset += 1u;
+        if (run_count > total_pixels - produced) {
+            return UDL_STREAM_PARSE_INVALID;
+        }
+        if (length - offset < bytes_per_pixel) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        offset += bytes_per_pixel;
+        produced += run_count;
+    }
+
+    *command_len_out = offset;
+    return UDL_STREAM_PARSE_COMPLETE;
 }
 
 static enum udl_stream_parse_result udl_transport_parse_writerlx_length(const uint8_t *command,
@@ -644,6 +1294,25 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
     }
 
     switch (command[1]) {
+    case UDL_CMD_OPAQUE_E0:
+        command_len = udl_transport_e0_command_length(command, length);
+        if (command_len == 0u) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+        *command_len_out = command_len;
+        return UDL_STREAM_PARSE_COMPLETE;
+    case UDL_CMD_NOP_A0:
+        *command_len_out = 2u;
+        return UDL_STREAM_PARSE_COMPLETE;
+    case UDL_CMD_UNKNOWN_40:
+        if (length < UDL_CMD_UNKNOWN_40_SIZE) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+        if (command[2] != UDL_CMD_UNKNOWN_40_ARG) {
+            return UDL_STREAM_PARSE_INVALID;
+        }
+        *command_len_out = UDL_CMD_UNKNOWN_40_SIZE;
+        return UDL_STREAM_PARSE_COMPLETE;
     case UDL_CMD_WRITEREG:
         if (length < 4u) {
             return UDL_STREAM_PARSE_NEED_MORE;
@@ -658,8 +1327,7 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
         command_len = 6u + (size_t)pixel_count;
         break;
     case UDL_CMD_WRITERL8:
-        command_len = 7u;
-        break;
+        return udl_transport_parse_writerl_length(command, length, 1u, command_len_out);
     case UDL_CMD_WRITECOPY8:
         command_len = 9u;
         break;
@@ -673,11 +1341,7 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
         command_len = 6u + ((size_t)pixel_count * 2u);
         break;
     case UDL_CMD_WRITERL16:
-        command_len = 8u;
-        if (length >= 9u && command[8] != UDL_MSG_BULK) {
-            command_len = 9u;
-        }
-        break;
+        return udl_transport_parse_writerl_length(command, length, 2u, command_len_out);
     case UDL_CMD_WRITECOPY16:
         command_len = 9u;
         break;
@@ -693,6 +1357,76 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
 
     *command_len_out = command_len;
     return UDL_STREAM_PARSE_COMPLETE;
+}
+
+static void udl_transport_record_first_resync(struct udl_transport *transport,
+                                              size_t pending_prefix_len,
+                                              size_t absolute_offset,
+                                              enum udl_transport_resync_reason reason)
+{
+    if (!transport || transport->last_feed_first_resync_reason != UDL_TRANSPORT_RESYNC_NONE) {
+        return;
+    }
+
+    transport->last_feed_first_resync_reason = reason;
+    transport->last_feed_first_resync_offset = 0u;
+    transport->last_feed_first_resync_offset_valid = false;
+
+    if (absolute_offset >= pending_prefix_len) {
+        transport->last_feed_first_resync_offset = absolute_offset - pending_prefix_len;
+        transport->last_feed_first_resync_offset_valid = true;
+    }
+}
+
+static void udl_transport_begin_writecomp_quarantine(struct udl_transport *transport)
+{
+    if (!transport) {
+        return;
+    }
+
+    transport->writecomp_quarantine_active = true;
+    transport->writecomp_quarantine_noncomp_ok = 0u;
+    transport->writecomp_quarantine_budget = UDL_WRITECOMP_QUARANTINE_BYTES;
+}
+
+static void udl_transport_note_noncompressed_success(struct udl_transport *transport)
+{
+    if (!transport || !transport->writecomp_quarantine_active) {
+        return;
+    }
+
+    if (transport->writecomp_quarantine_noncomp_ok < UDL_WRITECOMP_QUARANTINE_NONCOMP_REQUIRED) {
+        transport->writecomp_quarantine_noncomp_ok += 1u;
+    }
+    if (transport->writecomp_quarantine_noncomp_ok >= UDL_WRITECOMP_QUARANTINE_NONCOMP_REQUIRED) {
+        transport->writecomp_quarantine_active = false;
+        transport->writecomp_quarantine_budget = 0u;
+    }
+}
+
+static bool udl_transport_should_quarantine_writecomp(const struct udl_transport *transport)
+{
+    return transport &&
+           transport->writecomp_quarantine_active &&
+           transport->writecomp_quarantine_noncomp_ok < UDL_WRITECOMP_QUARANTINE_NONCOMP_REQUIRED &&
+           transport->writecomp_quarantine_budget > 0u;
+}
+
+static void udl_transport_consume_writecomp_quarantine_budget(struct udl_transport *transport,
+                                                              size_t consumed)
+{
+    if (!transport || !transport->writecomp_quarantine_active) {
+        return;
+    }
+
+    if (consumed >= transport->writecomp_quarantine_budget) {
+        transport->writecomp_quarantine_budget = 0u;
+        transport->writecomp_quarantine_active = false;
+        transport->writecomp_quarantine_noncomp_ok = 0u;
+        return;
+    }
+
+    transport->writecomp_quarantine_budget -= consumed;
 }
 
 static enum udl_transport_result udl_transport_reserve_pending(struct udl_transport *transport,
@@ -1597,6 +2331,260 @@ static enum udl_sink_result udl_sink_decode_writeraw(struct udl_sink *sink,
     return UDL_SINK_OK;
 }
 
+static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
+                                                      enum udl_sink_plane plane,
+                                                      const uint8_t *command,
+                                                      size_t remaining,
+                                                      size_t *consumed,
+                                                      struct udl_sink_damage *damage)
+{
+    const uint32_t byte_address = udl_sink_read_addr24(&command[2]);
+    const uint32_t pixel_count = udl_sink_count_from_byte(command[5]);
+    const uint32_t bytes_per_pixel = udl_sink_plane_bytes_per_pixel(plane);
+    const uint64_t visible_base = (uint64_t)udl_sink_plane_base(sink, plane);
+    const uint64_t visible_limit = visible_base + ((uint64_t)sink->plane_pixels * bytes_per_pixel);
+    const uint64_t command_byte_start = (uint64_t)byte_address;
+    const uint64_t command_byte_limit = command_byte_start + ((uint64_t)pixel_count * bytes_per_pixel);
+    enum udl_sink_result map_result;
+    struct udl_huffman_bitstream bitstream;
+    enum udl_sink_result result;
+    uint16_t decoded16[UDL_MAX_COMMAND_PIXELS];
+    uint8_t decoded8[UDL_MAX_COMMAND_PIXELS];
+    uint32_t first_visible_pixel = 0u;
+    uint32_t visible_pixel_count = 0u;
+    uint32_t skip_pixels = 0u;
+    uint32_t produced;
+
+    if (consumed) {
+        *consumed = 0u;
+    }
+
+    if (remaining < 6u) {
+        return UDL_SINK_ERR_TRUNCATED_COMMAND;
+    }
+
+    if (udl_sink_writecomp_debug_enabled) {
+        fprintf(stderr,
+                "writecomp begin cmd=0x%02x plane=%u addr=0x%06x count=%u remaining=%zu\\n",
+                (unsigned int)command[1],
+                (unsigned int)plane,
+                (unsigned int)byte_address,
+                (unsigned int)pixel_count,
+                remaining);
+    }
+
+    map_result = udl_sink_map_range(sink, plane, byte_address, pixel_count, &first_visible_pixel);
+    if (map_result == UDL_SINK_OK) {
+        visible_pixel_count = pixel_count;
+    } else if (map_result == UDL_SINK_ERR_ADDRESS_RANGE) {
+        if ((byte_address % bytes_per_pixel) != 0u) {
+            if (udl_sink_writecomp_debug_enabled) {
+                fprintf(stderr,
+                        "writecomp map fail cmd=0x%02x addr=0x%06x count=%u base16=0x%06x base8=0x%06x plane_pixels=%u err=%d\\n",
+                        (unsigned int)command[1],
+                        (unsigned int)byte_address,
+                        (unsigned int)pixel_count,
+                        (unsigned int)udl_sink_get_base16bpp(sink),
+                        (unsigned int)udl_sink_get_base8bpp(sink),
+                        (unsigned int)sink->plane_pixels,
+                        (int)UDL_SINK_ERR_INVALID_COMMAND);
+            }
+            return UDL_SINK_ERR_INVALID_COMMAND;
+        }
+
+        if (command_byte_start < visible_limit && command_byte_limit > visible_base) {
+            const uint64_t clipped_start = command_byte_start > visible_base ? command_byte_start : visible_base;
+            const uint64_t clipped_limit = command_byte_limit < visible_limit ? command_byte_limit : visible_limit;
+
+            if (clipped_start < clipped_limit) {
+                skip_pixels = (uint32_t)((clipped_start - command_byte_start) / bytes_per_pixel);
+                visible_pixel_count = (uint32_t)((clipped_limit - clipped_start) / bytes_per_pixel);
+                first_visible_pixel = (uint32_t)((clipped_start - visible_base) / bytes_per_pixel);
+            }
+        }
+    } else {
+        if (udl_sink_writecomp_debug_enabled) {
+            fprintf(stderr,
+                    "writecomp map fail cmd=0x%02x addr=0x%06x count=%u base16=0x%06x base8=0x%06x plane_pixels=%u err=%d\\n",
+                    (unsigned int)command[1],
+                    (unsigned int)byte_address,
+                    (unsigned int)pixel_count,
+                    (unsigned int)udl_sink_get_base16bpp(sink),
+                    (unsigned int)udl_sink_get_base8bpp(sink),
+                    (unsigned int)sink->plane_pixels,
+                    (int)map_result);
+        }
+        return map_result;
+    }
+
+    bitstream.bytes = &command[6];
+    bitstream.byte_length = remaining - 6u;
+    bitstream.byte_offset = 0u;
+    bitstream.bit_offset = 0u;
+
+    if (plane == UDL_SINK_PLANE_16) {
+        uint16_t previous_pixel = 0u;
+        uint32_t visible_index;
+
+        for (produced = 0u; produced < pixel_count; ++produced) {
+            int32_t diff;
+            uint8_t change = 0u;
+            uint16_t pixel;
+
+            result = udl_sink_huffman_read_bit(&bitstream, &change);
+            if (result != UDL_SINK_OK) {
+                if (consumed) {
+                    *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+                }
+                if (udl_sink_writecomp_debug_enabled) {
+                    fprintf(stderr,
+                            "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
+                            (unsigned int)command[1],
+                            (unsigned int)produced,
+                            (unsigned int)pixel_count,
+                            bitstream.byte_offset,
+                            (unsigned int)bitstream.bit_offset,
+                            (int)result);
+                }
+                return result;
+            }
+
+            if (change != 0u) {
+                result = udl_sink_huffman_read_diff(&bitstream, &diff);
+                if (result != UDL_SINK_OK) {
+                    if (consumed) {
+                        *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+                    }
+                    if (udl_sink_writecomp_debug_enabled) {
+                        fprintf(stderr,
+                                "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
+                                (unsigned int)command[1],
+                                (unsigned int)produced,
+                                (unsigned int)pixel_count,
+                                bitstream.byte_offset,
+                                (unsigned int)bitstream.bit_offset,
+                                (int)result);
+                    }
+                    return result;
+                }
+
+                pixel = (uint16_t)((uint32_t)previous_pixel + (uint32_t)(uint16_t)diff);
+            } else {
+                pixel = previous_pixel;
+            }
+
+            decoded16[produced] = pixel;
+            previous_pixel = pixel;
+        }
+
+        for (visible_index = 0u; visible_index < visible_pixel_count; ++visible_index) {
+            udl_sink_write_plane16(sink,
+                                   first_visible_pixel + visible_index,
+                                   decoded16[skip_pixels + visible_index],
+                                   damage);
+        }
+    } else {
+        uint8_t previous_pixel = 0u;
+        uint32_t visible_index;
+
+        for (produced = 0u; produced < pixel_count; ++produced) {
+            int32_t diff;
+            uint8_t change = 0u;
+            uint8_t pixel;
+
+            result = udl_sink_huffman_read_bit(&bitstream, &change);
+            if (result != UDL_SINK_OK) {
+                if (consumed) {
+                    *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+                }
+                if (udl_sink_writecomp_debug_enabled) {
+                    fprintf(stderr,
+                            "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
+                            (unsigned int)command[1],
+                            (unsigned int)produced,
+                            (unsigned int)pixel_count,
+                            bitstream.byte_offset,
+                            (unsigned int)bitstream.bit_offset,
+                            (int)result);
+                }
+                return result;
+            }
+
+            if (change != 0u) {
+                result = udl_sink_huffman_read_diff(&bitstream, &diff);
+                if (result != UDL_SINK_OK) {
+                    if (consumed) {
+                        *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+                    }
+                    if (udl_sink_writecomp_debug_enabled) {
+                        fprintf(stderr,
+                                "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
+                                (unsigned int)command[1],
+                                (unsigned int)produced,
+                                (unsigned int)pixel_count,
+                                bitstream.byte_offset,
+                                (unsigned int)bitstream.bit_offset,
+                                (int)result);
+                    }
+                    return result;
+                }
+
+                pixel = (uint8_t)((uint32_t)previous_pixel + (uint32_t)(uint8_t)diff);
+            } else {
+                pixel = previous_pixel;
+            }
+
+            decoded8[produced] = pixel;
+            previous_pixel = pixel;
+        }
+
+        for (visible_index = 0u; visible_index < visible_pixel_count; ++visible_index) {
+            udl_sink_write_plane8(sink,
+                                  first_visible_pixel + visible_index,
+                                  decoded8[skip_pixels + visible_index],
+                                  damage);
+        }
+    }
+
+    *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+
+    /* Some captures include short trailer/padding bytes between a completed
+     * WRITECOMP payload and the next bulk command marker. If we can
+     * unambiguously see "<pad...><0xaf><known-cmd>", absorb up to a small
+     * bounded trailer to avoid immediate transport resync churn.
+     */
+    {
+        size_t trailer_scan;
+
+        for (trailer_scan = 0u;
+             trailer_scan < 8u && *consumed + trailer_scan + 2u < remaining;
+             ++trailer_scan) {
+            const size_t pos = *consumed + trailer_scan;
+
+            if (command[pos] == UDL_MSG_BULK) {
+                break;
+            }
+
+            if (command[pos + 1u] == UDL_MSG_BULK &&
+                udl_transport_is_known_command_type(command[pos + 2u])) {
+                *consumed = pos + 1u;
+                break;
+            }
+        }
+    }
+
+    if (udl_sink_writecomp_debug_enabled) {
+        fprintf(stderr,
+                "writecomp ok cmd=0x%02x count=%u consumed=%zu huff_bytes=%zu\\n",
+                (unsigned int)command[1],
+                (unsigned int)pixel_count,
+                *consumed,
+                udl_sink_huffman_bytes_consumed(&bitstream));
+    }
+
+    return UDL_SINK_OK;
+}
+
 static enum udl_sink_result udl_sink_decode_writerl(struct udl_sink *sink,
                                                     enum udl_sink_plane plane,
                                                     const uint8_t *command,
@@ -1606,38 +2594,64 @@ static enum udl_sink_result udl_sink_decode_writerl(struct udl_sink *sink,
 {
     const uint32_t byte_address = udl_sink_read_addr24(&command[2]);
     const uint32_t pixel_count = udl_sink_count_from_byte(command[5]);
-    size_t command_size = 6u + udl_sink_plane_bytes_per_pixel(plane);
-    enum udl_sink_result result;
-    uint32_t first_pixel;
+    const uint32_t bytes_per_pixel = udl_sink_plane_bytes_per_pixel(plane);
+    const uint64_t visible_base = (uint64_t)udl_sink_plane_base(sink, plane);
+    const uint64_t visible_limit = visible_base + ((uint64_t)sink->plane_pixels * bytes_per_pixel);
+    uint32_t produced = 0u;
+    size_t offset = 6u;
 
-    if (plane == UDL_SINK_PLANE_16 && remaining >= 9u && command[8] != UDL_MSG_BULK) {
-        command_size = 9u;
-    }
-
-    if (remaining < command_size) {
+    if (remaining < 6u) {
         return UDL_SINK_ERR_TRUNCATED_COMMAND;
     }
 
-    result = udl_sink_map_range(sink, plane, byte_address, pixel_count, &first_pixel);
-    if (result != UDL_SINK_OK) {
-        return result;
+    if ((byte_address % bytes_per_pixel) != 0u) {
+        return UDL_SINK_ERR_INVALID_COMMAND;
     }
 
-    if (plane == UDL_SINK_PLANE_16) {
-        udl_sink_fill_plane16(sink,
-                              first_pixel,
-                              pixel_count,
-                              udl_sink_read_be16(&command[6]),
-                              damage);
-    } else {
-        udl_sink_fill_plane8(sink,
-                             first_pixel,
-                             pixel_count,
-                             command[6],
-                             damage);
+    while (produced < pixel_count) {
+        const uint32_t run_count = udl_sink_count_from_byte(command[offset]);
+        const uint64_t run_byte_start = (uint64_t)byte_address + ((uint64_t)produced * bytes_per_pixel);
+        const uint64_t run_byte_limit = run_byte_start + ((uint64_t)run_count * bytes_per_pixel);
+        const uint64_t clipped_start = run_byte_start > visible_base ? run_byte_start : visible_base;
+        const uint64_t clipped_limit = run_byte_limit < visible_limit ? run_byte_limit : visible_limit;
+
+        offset += 1u;
+        if (run_count > pixel_count - produced) {
+            return UDL_SINK_ERR_INVALID_COMMAND;
+        }
+        if (remaining - offset < bytes_per_pixel) {
+            return UDL_SINK_ERR_TRUNCATED_COMMAND;
+        }
+
+        if (clipped_start < clipped_limit) {
+            const uint64_t clipped_bytes = clipped_limit - clipped_start;
+            const uint64_t clipped_first_pixel = (clipped_start - visible_base) / bytes_per_pixel;
+            const uint32_t clipped_pixel_count = (uint32_t)(clipped_bytes / bytes_per_pixel);
+
+            if ((clipped_bytes % bytes_per_pixel) != 0u) {
+                return UDL_SINK_ERR_INVALID_COMMAND;
+            }
+
+            if (plane == UDL_SINK_PLANE_16) {
+                udl_sink_fill_plane16(sink,
+                                      (uint32_t)clipped_first_pixel,
+                                      clipped_pixel_count,
+                                      udl_sink_read_be16(&command[offset]),
+                                      damage);
+            } else {
+                udl_sink_fill_plane8(sink,
+                                     (uint32_t)clipped_first_pixel,
+                                     clipped_pixel_count,
+                                     command[offset],
+                                     damage);
+            }
+        }
+
+        offset += bytes_per_pixel;
+        produced += run_count;
     }
 
-    *consumed = command_size;
+    *consumed = offset;
     return UDL_SINK_OK;
 }
 
@@ -1859,6 +2873,30 @@ static enum udl_sink_result udl_sink_decode_command(struct udl_sink *sink,
     }
 
     switch (command[1]) {
+    case UDL_CMD_OPAQUE_E0:
+        (void)sink;
+        (void)damage;
+        *consumed = udl_transport_e0_command_length(command, remaining);
+        if (*consumed == 0u) {
+            return UDL_SINK_ERR_TRUNCATED_COMMAND;
+        }
+        return UDL_SINK_OK;
+    case UDL_CMD_NOP_A0:
+        (void)sink;
+        (void)damage;
+        *consumed = 2u;
+        return UDL_SINK_OK;
+    case UDL_CMD_UNKNOWN_40:
+        (void)sink;
+        (void)damage;
+        if (remaining < UDL_CMD_UNKNOWN_40_SIZE) {
+            return UDL_SINK_ERR_TRUNCATED_COMMAND;
+        }
+        if (command[2] != UDL_CMD_UNKNOWN_40_ARG) {
+            return UDL_SINK_ERR_INVALID_COMMAND;
+        }
+        *consumed = UDL_CMD_UNKNOWN_40_SIZE;
+        return UDL_SINK_OK;
     case UDL_CMD_WRITEREG:
         return udl_sink_decode_writereg(sink, command, remaining, consumed, damage);
     case UDL_CMD_WRITERAW8:
@@ -1869,6 +2907,8 @@ static enum udl_sink_result udl_sink_decode_command(struct udl_sink *sink,
         return udl_sink_decode_writecopy(sink, UDL_SINK_PLANE_8, command, remaining, consumed, damage);
     case UDL_CMD_WRITERLX8:
         return udl_sink_decode_writerlx(sink, UDL_SINK_PLANE_8, command, remaining, consumed, damage);
+    case UDL_CMD_WRITECOMP8:
+        return udl_sink_decode_writecomp(sink, UDL_SINK_PLANE_8, command, remaining, consumed, damage);
     case UDL_CMD_WRITERAW16:
         return udl_sink_decode_writeraw(sink, UDL_SINK_PLANE_16, command, remaining, consumed, damage);
     case UDL_CMD_WRITERL16:
@@ -1877,6 +2917,8 @@ static enum udl_sink_result udl_sink_decode_command(struct udl_sink *sink,
         return udl_sink_decode_writecopy(sink, UDL_SINK_PLANE_16, command, remaining, consumed, damage);
     case UDL_CMD_WRITERLX16:
         return udl_sink_decode_writerlx(sink, UDL_SINK_PLANE_16, command, remaining, consumed, damage);
+    case UDL_CMD_WRITECOMP16:
+        return udl_sink_decode_writecomp(sink, UDL_SINK_PLANE_16, command, remaining, consumed, damage);
     default:
         return UDL_SINK_ERR_INVALID_COMMAND;
     }
@@ -1975,6 +3017,11 @@ void udl_transport_set_writerlx16_span_stats(struct udl_transport *transport,
     transport->collect_writerlx16_span_stats = enabled;
 }
 
+void udl_transport_set_writecomp_debug(bool enabled)
+{
+    udl_sink_writecomp_debug_enabled = enabled;
+}
+
 void udl_transport_reset(struct udl_transport *transport)
 {
     if (!transport) {
@@ -1982,6 +3029,9 @@ void udl_transport_reset(struct udl_transport *transport)
     }
 
     transport->pending_len = 0u;
+    transport->writecomp_quarantine_active = false;
+    transport->writecomp_quarantine_noncomp_ok = 0u;
+    transport->writecomp_quarantine_budget = 0u;
     memset(&transport->stats, 0, sizeof(transport->stats));
 }
 
@@ -1995,6 +3045,9 @@ void udl_transport_destroy(struct udl_transport *transport)
     transport->pending = NULL;
     transport->pending_len = 0u;
     transport->pending_capacity = 0u;
+    transport->writecomp_quarantine_active = false;
+    transport->writecomp_quarantine_noncomp_ok = 0u;
+    transport->writecomp_quarantine_budget = 0u;
     memset(&transport->stats, 0, sizeof(transport->stats));
 }
 
@@ -2006,6 +3059,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
     enum udl_transport_result reserve_result;
     enum udl_sink_result sink_result;
     const bool collect_detailed_stats = transport && transport->collect_detailed_stats;
+    const size_t pending_prefix_len = transport ? transport->pending_len : 0u;
     size_t offset = 0u;
     struct udl_transport_stats stats_delta;
 
@@ -2027,6 +3081,11 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
     if (damage) {
         udl_sink_clear_damage(damage);
     }
+
+    transport->last_feed_pending_prefix_len = pending_prefix_len;
+    transport->last_feed_first_resync_offset = 0u;
+    transport->last_feed_first_resync_offset_valid = false;
+    transport->last_feed_first_resync_reason = UDL_TRANSPORT_RESYNC_NONE;
 
     if (transport->sink->width == 0u || transport->sink->height == 0u) {
         return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
@@ -2056,7 +3115,6 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
     transport->pending_len += length;
 
     while (offset < transport->pending_len) {
-        uint8_t *sync;
         uint8_t *pending = transport->pending + offset;
         size_t pending_len = transport->pending_len - offset;
         size_t command_len = 0u;
@@ -2067,16 +3125,47 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         enum udl_sink_result decode_result;
 
         if (pending[0] != UDL_MSG_BULK) {
-            sync = memchr(pending, UDL_MSG_BULK, pending_len);
-            if (!sync) {
+            size_t sync_offset = 0u;
+            bool needs_more = false;
+
+            if (!udl_transport_find_next_register_anchor(pending,
+                                                         pending_len,
+                                                         &sync_offset,
+                                                         &needs_more) &&
+                !udl_transport_find_next_command(pending,
+                                                 pending_len,
+                                                 &sync_offset,
+                                                 &needs_more)) {
+                if (needs_more) {
+                    if (sync_offset > 0u) {
+                        udl_transport_record_first_resync(transport,
+                                                          pending_prefix_len,
+                                                          offset,
+                                                          UDL_TRANSPORT_RESYNC_NON_BULK);
+                        stats_delta.dropped_bytes += sync_offset;
+                        offset += sync_offset;
+                    }
+                    break;
+                }
+
+                udl_transport_record_first_resync(transport,
+                                                  pending_prefix_len,
+                                                  offset,
+                                                  UDL_TRANSPORT_RESYNC_NON_BULK);
                 stats_delta.dropped_bytes += pending_len;
                 offset = transport->pending_len;
                 break;
             }
 
             {
-                const size_t skipped = (size_t)(sync - pending);
+                const size_t skipped = sync_offset;
 
+                if (skipped > 0u) {
+                    udl_transport_record_first_resync(transport,
+                                                      pending_prefix_len,
+                                                      offset,
+                                                      UDL_TRANSPORT_RESYNC_NON_BULK);
+                }
                 stats_delta.dropped_bytes += skipped;
                 offset += skipped;
                 pending = transport->pending + offset;
@@ -2088,11 +3177,37 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
             break;
         }
         if (pending[1] == UDL_MSG_BULK) {
+            udl_transport_record_first_resync(transport,
+                                              pending_prefix_len,
+                                              offset,
+                                              UDL_TRANSPORT_RESYNC_DOUBLE_BULK);
             offset += 1u;
             continue;
         }
 
         command_type = pending[1];
+
+        if (udl_transport_should_quarantine_writecomp(transport) &&
+            (command_type == UDL_CMD_WRITEREG ||
+             command_type == UDL_CMD_NOP_A0 ||
+             command_type == UDL_CMD_UNKNOWN_40 ||
+             command_type == UDL_CMD_OPAQUE_E0)) {
+            parse_result = udl_transport_next_command_length(pending,
+                                                             pending_len,
+                                                             &command_len);
+            if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
+                break;
+            }
+
+            if (parse_result == UDL_STREAM_PARSE_INVALID) {
+                command_len = 1u;
+            }
+
+            stats_delta.dropped_bytes += command_len;
+            udl_transport_consume_writecomp_quarantine_budget(transport, command_len);
+            offset += command_len;
+            continue;
+        }
 
         if (command_type == UDL_CMD_WRITERLX16) {
             udl_sink_clear_damage(&command_damage);
@@ -2108,8 +3223,186 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                 break;
             }
             if (parse_result == UDL_STREAM_PARSE_INVALID) {
+                size_t skipped = 1u;
+                size_t sync_offset = 0u;
+                bool needs_more = false;
+
+                udl_transport_record_first_resync(transport,
+                                                  pending_prefix_len,
+                                                  offset,
+                                                  UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
                 stats_delta.decode_errors += 1u;
-                offset += 1u;
+
+                if (pending_len > 1u &&
+                    udl_transport_find_next_framebuffer_command_strict(pending + 1u,
+                                                                       pending_len - 1u,
+                                                                       &sync_offset,
+                                                                       &needs_more)) {
+                    skipped = 1u + sync_offset;
+                } else if (needs_more) {
+                    skipped = pending_len - 1u;
+                    if (skipped == 0u) {
+                        break;
+                    }
+                } else {
+                    skipped = pending_len;
+                }
+
+                if (skipped > 1u) {
+                    stats_delta.dropped_bytes += skipped - 1u;
+                }
+                offset += skipped;
+                continue;
+            }
+
+            stats_delta.decoded_commands += 1u;
+            if (collect_detailed_stats && !command_damage.touched) {
+                stats_delta.no_damage_commands += 1u;
+            }
+            udl_transport_note_noncompressed_success(transport);
+            udl_sink_merge_damage(damage, &command_damage);
+            offset += command_len;
+            continue;
+        } else if (command_type == UDL_CMD_WRITECOMP8 ||
+                   command_type == UDL_CMD_WRITECOMP16) {
+            enum udl_stream_parse_result probe_result;
+
+            udl_sink_clear_damage(&command_damage);
+            if (collect_detailed_stats) {
+                udl_transport_record_command_type(&stats_delta, command_type);
+            }
+
+            probe_result = udl_transport_probe_writecomp_candidate(pending, pending_len);
+            if (probe_result == UDL_STREAM_PARSE_NEED_MORE) {
+                break;
+            }
+            if (probe_result == UDL_STREAM_PARSE_INVALID) {
+                size_t skipped = 1u;
+                size_t sync_offset = 0u;
+                bool needs_more = false;
+                bool strict_needs_more = false;
+
+                udl_transport_record_first_resync(transport,
+                                                  pending_prefix_len,
+                                                  offset,
+                                                  UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
+                stats_delta.decode_errors += 1u;
+                udl_transport_begin_writecomp_quarantine(transport);
+
+                if (pending_len > 1u &&
+                    udl_transport_find_next_register_anchor(pending + 1u,
+                                                            pending_len - 1u,
+                                                            &sync_offset,
+                                                            &needs_more)) {
+                    skipped = 1u + sync_offset;
+                } else if (pending_len > 1u &&
+                           udl_transport_find_next_framebuffer_command_strict(pending + 1u,
+                                                                              pending_len - 1u,
+                                                                              &sync_offset,
+                                                                              &needs_more)) {
+                    skipped = 1u + sync_offset;
+                } else if (pending_len > 1u &&
+                           udl_transport_find_next_command_strict(pending + 1u,
+                                                                  pending_len - 1u,
+                                                                  &sync_offset,
+                                                                  &strict_needs_more)) {
+                    skipped = 1u + sync_offset;
+                } else if (needs_more || strict_needs_more) {
+                    skipped = pending_len - 1u;
+                    if (skipped == 0u) {
+                        break;
+                    }
+                } else {
+                    skipped = pending_len;
+                }
+
+                if (skipped > 1u) {
+                    stats_delta.dropped_bytes += skipped - 1u;
+                }
+                udl_transport_consume_writecomp_quarantine_budget(transport, skipped);
+                offset += skipped;
+                continue;
+            }
+
+            decode_result = udl_sink_decode_command(transport->sink,
+                                                    pending,
+                                                    pending_len,
+                                                    &consumed,
+                                                    &command_damage);
+            if (decode_result == UDL_SINK_ERR_TRUNCATED_COMMAND) {
+                break;
+            }
+            if (decode_result == UDL_SINK_ERR_NO_MEMORY) {
+                return UDL_TRANSPORT_ERR_NO_MEMORY;
+            }
+            if (decode_result != UDL_SINK_OK) {
+                size_t skipped = 1u;
+                size_t scan_start = 1u;
+                size_t sync_offset = 0u;
+                size_t early_sync_offset = 0u;
+                bool needs_more = false;
+                bool early_needs_more = false;
+                bool strict_needs_more = false;
+
+                udl_transport_record_first_resync(transport,
+                                                  pending_prefix_len,
+                                                  offset,
+                                                  UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
+                stats_delta.decode_errors += 1u;
+                udl_transport_begin_writecomp_quarantine(transport);
+
+                /* On Huffman decode failure, use consumed as a lower-bound
+                 * scan start rather than an exact skip; random payload bits
+                 * can otherwise keep us walking bogus compressed headers.
+                 */
+                if (consumed > 1u && consumed < pending_len) {
+                    scan_start = consumed;
+                }
+
+                /* First, prefer an early strong register anchor from the
+                 * start of the failed command tail. This avoids skipping past
+                 * a legitimate boundary when consumed points into garbage.
+                 */
+                if (pending_len > 1u &&
+                    udl_transport_find_next_register_anchor(pending + 1u,
+                                                            pending_len - 1u,
+                                                            &early_sync_offset,
+                                                            &early_needs_more)) {
+                    skipped = 1u + early_sync_offset;
+                } else if (pending_len > scan_start &&
+                    udl_transport_find_next_register_anchor(pending + scan_start,
+                                                            pending_len - scan_start,
+                                                            &sync_offset,
+                                                            &needs_more)) {
+                    skipped = scan_start + sync_offset;
+                } else if (pending_len > scan_start &&
+                           udl_transport_find_next_framebuffer_command_strict(pending + scan_start,
+                                                                              pending_len - scan_start,
+                                                                              &sync_offset,
+                                                                              &needs_more)) {
+                    skipped = scan_start + sync_offset;
+                } else if (pending_len > scan_start &&
+                           udl_transport_find_next_command_strict(pending + scan_start,
+                                                                  pending_len - scan_start,
+                                                                  &sync_offset,
+                                                                  &strict_needs_more)) {
+                    skipped = scan_start + sync_offset;
+                } else if (early_needs_more || needs_more || strict_needs_more) {
+                    skipped = scan_start + sync_offset;
+                    if (skipped >= pending_len) {
+                        break;
+                    }
+                } else if (consumed > 1u && consumed <= pending_len) {
+                    skipped = consumed;
+                } else {
+                    skipped = pending_len;
+                }
+
+                if (skipped > 1u) {
+                    stats_delta.dropped_bytes += skipped - 1u;
+                }
+                udl_transport_consume_writecomp_quarantine_budget(transport, skipped);
+                offset += skipped;
                 continue;
             }
 
@@ -2118,7 +3411,7 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                 stats_delta.no_damage_commands += 1u;
             }
             udl_sink_merge_damage(damage, &command_damage);
-            offset += command_len;
+            offset += consumed;
             continue;
         } else {
             parse_result = udl_transport_next_command_length(pending,
@@ -2129,8 +3422,41 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
             break;
         }
         if (parse_result == UDL_STREAM_PARSE_INVALID) {
+            size_t skipped = 1u;
+            size_t sync_offset = 0u;
+            bool needs_more = false;
+
+            udl_transport_record_first_resync(transport,
+                                              pending_prefix_len,
+                                              offset,
+                                              UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
             stats_delta.decode_errors += 1u;
-            offset += 1u;
+
+            if (pending_len > 1u &&
+                udl_transport_find_next_register_anchor(pending + 1u,
+                                                        pending_len - 1u,
+                                                        &sync_offset,
+                                                        &needs_more)) {
+                skipped = 1u + sync_offset;
+            } else if (pending_len > 1u &&
+                       udl_transport_find_next_command(pending + 1u,
+                                                       pending_len - 1u,
+                                                       &sync_offset,
+                                                       &needs_more)) {
+                skipped = 1u + sync_offset;
+            } else if (needs_more) {
+                skipped = pending_len - 1u;
+                if (skipped == 0u) {
+                    break;
+                }
+            } else {
+                skipped = pending_len;
+            }
+
+            if (skipped > 1u) {
+                stats_delta.dropped_bytes += skipped - 1u;
+            }
+            offset += skipped;
             continue;
         }
 
@@ -2165,6 +3491,9 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
         stats_delta.decoded_commands += 1u;
         if (collect_detailed_stats && !command_damage.touched) {
             stats_delta.no_damage_commands += 1u;
+        }
+        if (udl_transport_is_framebuffer_command(command_type)) {
+            udl_transport_note_noncompressed_success(transport);
         }
         udl_sink_merge_damage(damage, &command_damage);
         offset += command_len;
