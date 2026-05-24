@@ -674,6 +674,9 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
         break;
     case UDL_CMD_WRITERL16:
         command_len = 8u;
+        if (length >= 9u && command[8] != UDL_MSG_BULK) {
+            command_len = 9u;
+        }
         break;
     case UDL_CMD_WRITECOPY16:
         command_len = 9u;
@@ -1603,9 +1606,13 @@ static enum udl_sink_result udl_sink_decode_writerl(struct udl_sink *sink,
 {
     const uint32_t byte_address = udl_sink_read_addr24(&command[2]);
     const uint32_t pixel_count = udl_sink_count_from_byte(command[5]);
-    const size_t command_size = 6u + udl_sink_plane_bytes_per_pixel(plane);
+    size_t command_size = 6u + udl_sink_plane_bytes_per_pixel(plane);
     enum udl_sink_result result;
     uint32_t first_pixel;
+
+    if (plane == UDL_SINK_PLANE_16 && remaining >= 9u && command[8] != UDL_MSG_BULK) {
+        command_size = 9u;
+    }
 
     if (remaining < command_size) {
         return UDL_SINK_ERR_TRUNCATED_COMMAND;
