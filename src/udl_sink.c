@@ -262,6 +262,19 @@ static enum udl_sink_result udl_sink_huffman_read_bit(struct udl_huffman_bitstre
         return UDL_SINK_ERR_TRUNCATED_COMMAND;
     }
 
+    while (bitstream->bit_offset == 0u &&
+           bitstream->byte_offset + 4u <= bitstream->byte_length &&
+           bitstream->bytes[bitstream->byte_offset] == UDL_MSG_BULK &&
+           bitstream->bytes[bitstream->byte_offset + 1u] == UDL_CMD_WRITEREG &&
+           bitstream->bytes[bitstream->byte_offset + 2u] == 0xffu &&
+           bitstream->bytes[bitstream->byte_offset + 3u] == 0xffu) {
+        bitstream->byte_offset += 4u;
+    }
+
+    if (bitstream->byte_offset >= bitstream->byte_length) {
+        return UDL_SINK_ERR_TRUNCATED_COMMAND;
+    }
+
     bit = (uint8_t)((bitstream->bytes[bitstream->byte_offset] >> bitstream->bit_offset) & 0x01u);
     bitstream->bit_offset += 1u;
     if (bitstream->bit_offset == 8u) {
@@ -280,6 +293,20 @@ static enum udl_sink_result udl_sink_huffman_read_diff(struct udl_huffman_bitstr
 
     if (!bitstream || !diff_out) {
         return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    /*
+     * Some host streams inject AF 20 FF FF separators into WRITECOMP payloads
+     * at byte boundaries (documented in tubecable notes). These bytes are not
+     * Huffman payload and must be skipped to keep bitstream alignment.
+     */
+    while (bitstream->bit_offset == 0u &&
+           bitstream->byte_offset + 4u <= bitstream->byte_length &&
+           bitstream->bytes[bitstream->byte_offset] == UDL_MSG_BULK &&
+           bitstream->bytes[bitstream->byte_offset + 1u] == UDL_CMD_WRITEREG &&
+           bitstream->bytes[bitstream->byte_offset + 2u] == 0xffu &&
+           bitstream->bytes[bitstream->byte_offset + 3u] == 0xffu) {
+        bitstream->byte_offset += 4u;
     }
 
     if (!udl_sink_huffman_ensure_tree()) {
@@ -712,6 +739,131 @@ static enum udl_stream_parse_result udl_transport_probe_command_candidate(const 
     return udl_transport_next_command_length(command, length, &command_len);
 }
 
+static uint32_t udl_transport_read_plane_base(const struct udl_sink *sink,
+                                              enum udl_sink_plane plane)
+{
+    if (!sink) {
+        return 0u;
+    }
+
+    if (plane == UDL_SINK_PLANE_16) {
+        return ((uint32_t)sink->registers[UDL_REG_BASE16BPP_ADDR2] << 16) |
+               ((uint32_t)sink->registers[UDL_REG_BASE16BPP_ADDR1] << 8) |
+               (uint32_t)sink->registers[UDL_REG_BASE16BPP_ADDR0];
+    }
+
+    return ((uint32_t)sink->registers[UDL_REG_BASE8BPP_ADDR2] << 16) |
+           ((uint32_t)sink->registers[UDL_REG_BASE8BPP_ADDR1] << 8) |
+           (uint32_t)sink->registers[UDL_REG_BASE8BPP_ADDR0];
+}
+
+static bool udl_transport_range_intersects_visible_plane(const struct udl_sink *sink,
+                                                         enum udl_sink_plane plane,
+                                                         uint32_t byte_address,
+                                                         uint32_t pixel_count)
+{
+    const uint32_t bytes_per_pixel = plane == UDL_SINK_PLANE_16 ? 2u : 1u;
+    const uint64_t plane_pixels = sink->plane_pixels != 0u
+        ? (uint64_t)sink->plane_pixels
+        : ((uint64_t)sink->width * (uint64_t)sink->height);
+    const uint64_t visible_base = (uint64_t)udl_transport_read_plane_base(sink, plane);
+    const uint64_t visible_limit = visible_base + (plane_pixels * bytes_per_pixel);
+    const uint64_t command_start = (uint64_t)byte_address;
+    const uint64_t command_limit = command_start + ((uint64_t)pixel_count * bytes_per_pixel);
+
+    if (!sink || pixel_count == 0u) {
+        return true;
+    }
+
+    if (bytes_per_pixel == 2u && (byte_address & 0x1u) != 0u) {
+        return false;
+    }
+
+    if (command_limit <= command_start) {
+        return false;
+    }
+
+    return command_limit > visible_base && command_start < visible_limit;
+}
+
+static bool udl_transport_command_plausible_for_sink(const struct udl_sink *sink,
+                                                     const uint8_t *command,
+                                                     size_t length)
+{
+    uint32_t pixel_count;
+
+    if (!sink || !command || length < 2u) {
+        return true;
+    }
+
+    switch (command[1]) {
+    case UDL_CMD_WRITERAW8:
+    case UDL_CMD_WRITERL8:
+    case UDL_CMD_WRITERLX8:
+    case UDL_CMD_WRITECOMP8:
+        if (length < 6u) {
+            return false;
+        }
+        pixel_count = udl_sink_count_from_byte(command[5]);
+        return udl_transport_range_intersects_visible_plane(sink,
+                                                            UDL_SINK_PLANE_8,
+                                                            ((uint32_t)command[2] << 16) |
+                                                                ((uint32_t)command[3] << 8) |
+                                                                (uint32_t)command[4],
+                                                            pixel_count);
+    case UDL_CMD_WRITERAW16:
+    case UDL_CMD_WRITERL16:
+    case UDL_CMD_WRITERLX16:
+    case UDL_CMD_WRITECOMP16:
+        if (length < 6u) {
+            return false;
+        }
+        pixel_count = udl_sink_count_from_byte(command[5]);
+        return udl_transport_range_intersects_visible_plane(sink,
+                                                            UDL_SINK_PLANE_16,
+                                                            ((uint32_t)command[2] << 16) |
+                                                                ((uint32_t)command[3] << 8) |
+                                                                (uint32_t)command[4],
+                                                            pixel_count);
+    case UDL_CMD_WRITECOPY8:
+        if (length < 9u) {
+            return false;
+        }
+        pixel_count = udl_sink_count_from_byte(command[5]);
+        return udl_transport_range_intersects_visible_plane(sink,
+                                                            UDL_SINK_PLANE_8,
+                                                            ((uint32_t)command[2] << 16) |
+                                                                ((uint32_t)command[3] << 8) |
+                                                                (uint32_t)command[4],
+                                                            pixel_count) ||
+               udl_transport_range_intersects_visible_plane(sink,
+                                                            UDL_SINK_PLANE_8,
+                                                            ((uint32_t)command[6] << 16) |
+                                                                ((uint32_t)command[7] << 8) |
+                                                                (uint32_t)command[8],
+                                                            pixel_count);
+    case UDL_CMD_WRITECOPY16:
+        if (length < 9u) {
+            return false;
+        }
+        pixel_count = udl_sink_count_from_byte(command[5]);
+        return udl_transport_range_intersects_visible_plane(sink,
+                                                            UDL_SINK_PLANE_16,
+                                                            ((uint32_t)command[2] << 16) |
+                                                                ((uint32_t)command[3] << 8) |
+                                                                (uint32_t)command[4],
+                                                            pixel_count) ||
+               udl_transport_range_intersects_visible_plane(sink,
+                                                            UDL_SINK_PLANE_16,
+                                                            ((uint32_t)command[6] << 16) |
+                                                                ((uint32_t)command[7] << 8) |
+                                                                (uint32_t)command[8],
+                                                            pixel_count);
+    default:
+        return true;
+    }
+}
+
 static bool udl_transport_find_next_command_mode(const uint8_t *buffer,
                                                  size_t length,
                                                  size_t *offset_out,
@@ -782,7 +934,8 @@ static bool udl_transport_find_next_command_mode(const uint8_t *buffer,
 /* Prefer a strong stream anchor when recovering from desync.
  * `af 20 ff xx` is a common command-boundary marker (WRITEREG VIDREG).
  */
-static bool udl_transport_find_next_register_anchor(const uint8_t *buffer,
+static bool udl_transport_find_next_register_anchor(const struct udl_sink *sink,
+                                                    const uint8_t *buffer,
                                                     size_t length,
                                                     size_t *offset_out,
                                                     bool *needs_more_out)
@@ -828,6 +981,35 @@ static bool udl_transport_find_next_register_anchor(const uint8_t *buffer,
                                                          length - offset,
                                                          &anchor_len);
         if (parse_result == UDL_STREAM_PARSE_COMPLETE && anchor_len == 4u) {
+            if (offset + anchor_len >= length) {
+                *offset_out = offset;
+                return true;
+            }
+
+            if (buffer[offset + anchor_len] != UDL_MSG_BULK) {
+                continue;
+            }
+
+            parse_result = udl_transport_probe_command_candidate(buffer + offset + anchor_len,
+                                                                 length - offset - anchor_len);
+            if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
+                *offset_out = offset;
+                *needs_more_out = true;
+                return false;
+            }
+
+            if (parse_result == UDL_STREAM_PARSE_COMPLETE &&
+                udl_transport_command_plausible_for_sink(sink,
+                                                         buffer + offset + anchor_len,
+                                                         length - offset - anchor_len)) {
+                *offset_out = offset;
+                return true;
+            }
+
+            continue;
+        }
+
+        if (parse_result == UDL_STREAM_PARSE_COMPLETE && anchor_len == 0u) {
             *offset_out = offset;
             return true;
         }
@@ -933,7 +1115,13 @@ static enum udl_stream_parse_result udl_transport_parse_writerl_length(const uin
     }
 
     while (produced < total_pixels) {
-        const uint32_t run_count = udl_sink_count_from_byte(command[offset]);
+        uint32_t run_count;
+
+        if (offset >= length) {
+            return UDL_STREAM_PARSE_NEED_MORE;
+        }
+
+        run_count = udl_sink_count_from_byte(command[offset]);
 
         offset += 1u;
         if (run_count > total_pixels - produced) {
@@ -2548,26 +2736,29 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
 
     *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
 
-    /* Some captures include short trailer/padding bytes between a completed
-     * WRITECOMP payload and the next bulk command marker. If we can
-     * unambiguously see "<pad...><0xaf><known-cmd>", absorb up to a small
-     * bounded trailer to avoid immediate transport resync churn.
+    /* Some captures include non-Huffman trailer/padding bytes between a
+     * completed WRITECOMP payload and the next command marker. Scan ahead from
+     * the minimum Huffman-consumed boundary to the first parse-valid command.
      */
     {
-        size_t trailer_scan;
+        const size_t min_consumed = *consumed;
+        const size_t scan_limit = min_consumed + 256u < remaining
+            ? min_consumed + 256u
+            : remaining;
+        size_t pos;
 
-        for (trailer_scan = 0u;
-             trailer_scan < 8u && *consumed + trailer_scan + 2u < remaining;
-             ++trailer_scan) {
-            const size_t pos = *consumed + trailer_scan;
+        for (pos = min_consumed; pos + 2u <= scan_limit; ++pos) {
+            enum udl_stream_parse_result probe_result;
 
-            if (command[pos] == UDL_MSG_BULK) {
-                break;
+            if (command[pos] != UDL_MSG_BULK ||
+                !udl_transport_is_known_command_type(command[pos + 1u])) {
+                continue;
             }
 
-            if (command[pos + 1u] == UDL_MSG_BULK &&
-                udl_transport_is_known_command_type(command[pos + 2u])) {
-                *consumed = pos + 1u;
+            probe_result = udl_transport_probe_command_candidate(command + pos,
+                                                                  remaining - pos);
+            if (probe_result == UDL_STREAM_PARSE_COMPLETE) {
+                *consumed = pos;
                 break;
             }
         }
@@ -2609,46 +2800,55 @@ static enum udl_sink_result udl_sink_decode_writerl(struct udl_sink *sink,
     }
 
     while (produced < pixel_count) {
-        const uint32_t run_count = udl_sink_count_from_byte(command[offset]);
+        uint32_t run_count;
         const uint64_t run_byte_start = (uint64_t)byte_address + ((uint64_t)produced * bytes_per_pixel);
-        const uint64_t run_byte_limit = run_byte_start + ((uint64_t)run_count * bytes_per_pixel);
-        const uint64_t clipped_start = run_byte_start > visible_base ? run_byte_start : visible_base;
-        const uint64_t clipped_limit = run_byte_limit < visible_limit ? run_byte_limit : visible_limit;
 
-        offset += 1u;
-        if (run_count > pixel_count - produced) {
-            return UDL_SINK_ERR_INVALID_COMMAND;
-        }
-        if (remaining - offset < bytes_per_pixel) {
+        if (offset >= remaining) {
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
         }
 
-        if (clipped_start < clipped_limit) {
-            const uint64_t clipped_bytes = clipped_limit - clipped_start;
-            const uint64_t clipped_first_pixel = (clipped_start - visible_base) / bytes_per_pixel;
-            const uint32_t clipped_pixel_count = (uint32_t)(clipped_bytes / bytes_per_pixel);
+        run_count = udl_sink_count_from_byte(command[offset]);
 
-            if ((clipped_bytes % bytes_per_pixel) != 0u) {
+        {
+            const uint64_t run_byte_limit = run_byte_start + ((uint64_t)run_count * bytes_per_pixel);
+            const uint64_t clipped_start = run_byte_start > visible_base ? run_byte_start : visible_base;
+            const uint64_t clipped_limit = run_byte_limit < visible_limit ? run_byte_limit : visible_limit;
+
+            offset += 1u;
+            if (run_count > pixel_count - produced) {
                 return UDL_SINK_ERR_INVALID_COMMAND;
             }
-
-            if (plane == UDL_SINK_PLANE_16) {
-                udl_sink_fill_plane16(sink,
-                                      (uint32_t)clipped_first_pixel,
-                                      clipped_pixel_count,
-                                      udl_sink_read_be16(&command[offset]),
-                                      damage);
-            } else {
-                udl_sink_fill_plane8(sink,
-                                     (uint32_t)clipped_first_pixel,
-                                     clipped_pixel_count,
-                                     command[offset],
-                                     damage);
+            if (remaining - offset < bytes_per_pixel) {
+                return UDL_SINK_ERR_TRUNCATED_COMMAND;
             }
-        }
 
-        offset += bytes_per_pixel;
-        produced += run_count;
+            if (clipped_start < clipped_limit) {
+                const uint64_t clipped_bytes = clipped_limit - clipped_start;
+                const uint64_t clipped_first_pixel = (clipped_start - visible_base) / bytes_per_pixel;
+                const uint32_t clipped_pixel_count = (uint32_t)(clipped_bytes / bytes_per_pixel);
+
+                if ((clipped_bytes % bytes_per_pixel) != 0u) {
+                    return UDL_SINK_ERR_INVALID_COMMAND;
+                }
+
+                if (plane == UDL_SINK_PLANE_16) {
+                    udl_sink_fill_plane16(sink,
+                                          (uint32_t)clipped_first_pixel,
+                                          clipped_pixel_count,
+                                          udl_sink_read_be16(&command[offset]),
+                                          damage);
+                } else {
+                    udl_sink_fill_plane8(sink,
+                                         (uint32_t)clipped_first_pixel,
+                                         clipped_pixel_count,
+                                         command[offset],
+                                         damage);
+                }
+            }
+
+            offset += bytes_per_pixel;
+            produced += run_count;
+        }
     }
 
     *consumed = offset;
@@ -3128,7 +3328,8 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
             size_t sync_offset = 0u;
             bool needs_more = false;
 
-            if (!udl_transport_find_next_register_anchor(pending,
+            if (!udl_transport_find_next_register_anchor(transport->sink,
+                                                         pending,
                                                          pending_len,
                                                          &sync_offset,
                                                          &needs_more) &&
@@ -3290,7 +3491,8 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                 udl_transport_begin_writecomp_quarantine(transport);
 
                 if (pending_len > 1u &&
-                    udl_transport_find_next_register_anchor(pending + 1u,
+                    udl_transport_find_next_register_anchor(transport->sink,
+                                                            pending + 1u,
                                                             pending_len - 1u,
                                                             &sync_offset,
                                                             &needs_more)) {
@@ -3364,13 +3566,15 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                  * a legitimate boundary when consumed points into garbage.
                  */
                 if (pending_len > 1u &&
-                    udl_transport_find_next_register_anchor(pending + 1u,
+                    udl_transport_find_next_register_anchor(transport->sink,
+                                                            pending + 1u,
                                                             pending_len - 1u,
                                                             &early_sync_offset,
                                                             &early_needs_more)) {
                     skipped = 1u + early_sync_offset;
                 } else if (pending_len > scan_start &&
-                    udl_transport_find_next_register_anchor(pending + scan_start,
+                    udl_transport_find_next_register_anchor(transport->sink,
+                                                            pending + scan_start,
                                                             pending_len - scan_start,
                                                             &sync_offset,
                                                             &needs_more)) {
@@ -3433,7 +3637,8 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
             stats_delta.decode_errors += 1u;
 
             if (pending_len > 1u &&
-                udl_transport_find_next_register_anchor(pending + 1u,
+                udl_transport_find_next_register_anchor(transport->sink,
+                                                        pending + 1u,
                                                         pending_len - 1u,
                                                         &sync_offset,
                                                         &needs_more)) {
