@@ -35,7 +35,7 @@ enum {
     UDL_MAX_COMMAND_PIXELS = 256u,
     UDL_CMD_UNKNOWN_40_SIZE = 3u,
     UDL_CMD_UNKNOWN_40_ARG = 0x0bu,
-    UDL_CMD_E0_HEADER_SIZE = 9u,
+    UDL_CMD_E0_HEADER_SIZE = 10u,
     UDL_CMD_E0_RECORD_SIZE = 9u,
     UDL_CMD_E0_RECORD_COUNT = 512u,
     UDL_CMD_E0_TOTAL_SIZE = UDL_CMD_E0_HEADER_SIZE + (UDL_CMD_E0_RECORD_SIZE * UDL_CMD_E0_RECORD_COUNT),
@@ -72,8 +72,310 @@ struct udl_huffman_bitstream {
     uint8_t bit_offset;
 };
 
+struct udl_huffman_cursor_probe {
+    enum udl_sink_result result;
+    size_t end_byte_offset;
+    uint8_t end_bit_offset;
+    uint32_t invalid_node;
+    uint8_t invalid_bit;
+    uint32_t invalid_next;
+};
+
 static struct udl_huffman_tree udl_huffman_tree;
 static bool udl_sink_writecomp_debug_enabled = false;
+static bool udl_sink_writecomp_live_table_decode_enabled = false;
+static bool udl_sink_writecomp_live_table_zerokvm_enabled = false;
+static bool udl_sink_writecomp_live_table_state_carry_enabled = false;
+static bool udl_sink_writecomp_live_table_state_global_enabled = false;
+static bool udl_sink_writecomp_live_table_pixel_carry_enabled = false;
+static bool udl_sink_writecomp_live_table_diff_low16_enabled = false;
+static bool udl_sink_writecomp_live_table_reference_leaf_enabled = false;
+static bool udl_sink_writecomp_live_table_no_change_bit_enabled = false;
+static bool udl_sink_writecomp_live_table_state_seed_enabled = false;
+static uint16_t udl_sink_writecomp_live_table_state_seed = 0u;
+static bool udl_sink_writecomp_live_table_state_seed16_enabled = false;
+static uint16_t udl_sink_writecomp_live_table_state_seed16 = 0u;
+static bool udl_sink_writecomp_live_table_state_seed8_enabled = false;
+static uint16_t udl_sink_writecomp_live_table_state_seed8 = 0u;
+static bool udl_sink_writecomp_hybrid_static_live_enabled = false;
+static bool udl_sink_writecomp_trace_target_enabled = false;
+static bool udl_sink_writecomp_trace_target_hit = false;
+static bool udl_sink_writecomp_trace_visible_pixel_enabled = false;
+static bool udl_sink_writecomp_trace_visible_pixel_hit = false;
+static bool udl_sink_writecomp_trace_first_failure_enabled = false;
+static bool udl_sink_writecomp_trace_first_failure_hit = false;
+static bool udl_sink_writecomp_trace_first_failure_probe_done = false;
+static uint8_t udl_sink_writecomp_trace_target_command = 0u;
+static uint32_t udl_sink_writecomp_trace_target_pixel = 0u;
+static uint32_t udl_sink_writecomp_trace_visible_pixel = 0u;
+static size_t udl_sink_writecomp_trace_target_byte = 0u;
+static uint8_t udl_sink_writecomp_trace_target_bit = 0u;
+
+struct udl_sink_zerokvm_branch {
+    uint16_t color;
+    uint16_t jump;
+};
+
+#define UDL_STATIC_DEVICE_TABLE_SIGNATURE UINT64_C(0xdce6a77a1efb9fc8)
+
+static enum udl_sink_result udl_sink_huffman_read_bit(struct udl_huffman_bitstream *bitstream,
+                                                      uint8_t *bit_out);
+
+static uint64_t udl_sink_signature64(const uint8_t *data, size_t length)
+{
+    uint64_t hash = 1469598103934665603ull;
+    size_t index;
+
+    for (index = 0u; index < length; ++index) {
+        hash ^= (uint64_t)data[index];
+        hash *= 1099511628211ull;
+    }
+
+    return hash;
+}
+
+static bool udl_sink_get_device_table_zerokvm_branch(const struct udl_sink *sink,
+                                                     uint16_t record_index,
+                                                     bool right_branch,
+                                                     struct udl_sink_zerokvm_branch *branch_out)
+{
+    const uint8_t *record;
+
+    if (!sink || !branch_out || !sink->huffman_device_table_loaded) {
+        return false;
+    }
+
+    if (record_index >= UDL_CMD_E0_RECORD_COUNT) {
+        return false;
+    }
+
+    record = &sink->huffman_device_table[(size_t)record_index * UDL_CMD_E0_RECORD_SIZE];
+    if (!right_branch) {
+        branch_out->color = (uint16_t)(((uint16_t)record[0] << 8) | (uint16_t)record[1]);
+        branch_out->jump = (uint16_t)((((uint16_t)record[3] & 0x1fu) << 4) |
+                                      ((uint16_t)record[4] >> 4));
+    } else {
+        branch_out->color = (uint16_t)(((uint16_t)record[5] << 8) | (uint16_t)record[6]);
+        branch_out->jump = (uint16_t)((((uint16_t)record[8] & 0x1fu) << 4) |
+                                      ((uint16_t)record[4] & 0x0fu));
+    }
+
+    return branch_out->jump < UDL_CMD_E0_RECORD_COUNT;
+}
+
+bool udl_sink_get_device_table_branch(const struct udl_sink *sink,
+                                      uint16_t record_index,
+                                      bool right_branch,
+                                      struct udl_sink_device_table_branch *branch_out)
+{
+    const uint8_t *record;
+    uint32_t value;
+    uint8_t tag;
+
+    if (!sink || !branch_out || !sink->huffman_device_table_loaded) {
+        return false;
+    }
+
+    if (record_index >= UDL_CMD_E0_RECORD_COUNT) {
+        return false;
+    }
+
+    record = &sink->huffman_device_table[(size_t)record_index * UDL_CMD_E0_RECORD_SIZE];
+    tag = record[4];
+    memset(branch_out, 0, sizeof(*branch_out));
+
+    if (!right_branch) {
+        value = ((uint32_t)record[0] << 24) |
+                ((uint32_t)record[1] << 16) |
+                ((uint32_t)record[2] << 8) |
+                (uint32_t)record[3];
+        branch_out->meta_bits = (uint8_t)(tag >> 4);
+    } else {
+        value = ((uint32_t)record[5] << 24) |
+                ((uint32_t)record[6] << 16) |
+                ((uint32_t)record[7] << 8) |
+                (uint32_t)record[8];
+        branch_out->meta_bits = (uint8_t)(tag & 0x0fu);
+    }
+
+    if (value <= 0x1ffu) {
+        branch_out->is_reference = true;
+        branch_out->reference_state = (uint16_t)value;
+        return true;
+    }
+
+    branch_out->diff16 = udl_sink_writecomp_live_table_diff_low16_enabled
+        ? (int16_t)(value & 0xffffu)
+        : (int16_t)(value >> 16);
+    branch_out->continuation_state = (uint16_t)(value & 0x1ffu);
+    branch_out->aux_bits = (uint8_t)((value >> 9) & 0x7fu);
+    return true;
+}
+
+static enum udl_sink_result udl_sink_decode_device_table_diff_internal(const struct udl_sink *sink,
+                                                                       struct udl_huffman_bitstream *bitstream,
+                                                                       uint16_t *state_io,
+                                                                       int32_t *diff_out)
+{
+    uint16_t state;
+
+    if (!sink || !bitstream || !state_io || !diff_out) {
+        return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    if (!sink->huffman_device_table_loaded) {
+        return UDL_SINK_ERR_INVALID_COMMAND;
+    }
+
+    state = *state_io;
+
+    for (;;) {
+        struct udl_sink_device_table_branch branch;
+        uint8_t bit;
+        enum udl_sink_result result;
+
+        result = udl_sink_huffman_read_bit(bitstream, &bit);
+        if (result != UDL_SINK_OK) {
+            return result;
+        }
+
+        if (!udl_sink_get_device_table_branch(sink, state, bit != 0u, &branch)) {
+            return UDL_SINK_ERR_INVALID_COMMAND;
+        }
+
+        if (branch.is_reference) {
+            if (udl_sink_writecomp_live_table_reference_leaf_enabled) {
+                *state_io = branch.reference_state;
+                *diff_out = 0;
+                return UDL_SINK_OK;
+            }
+
+            state = branch.reference_state;
+            continue;
+        }
+
+        *state_io = branch.continuation_state;
+        *diff_out = branch.diff16;
+        return UDL_SINK_OK;
+    }
+}
+
+enum udl_sink_result udl_sink_decode_device_table_diff(const struct udl_sink *sink,
+                                                       uint16_t *state_io,
+                                                       const uint8_t *bitstream,
+                                                       size_t bit_count,
+                                                       size_t *bit_offset_io,
+                                                       int16_t *diff_out)
+{
+    struct udl_huffman_bitstream cursor;
+    int32_t diff32;
+    enum udl_sink_result result;
+    size_t start_bit_offset;
+    size_t end_bit_offset;
+
+    if (!sink || !state_io || !bitstream || !bit_offset_io || !diff_out) {
+        return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    start_bit_offset = *bit_offset_io;
+    if (start_bit_offset >= bit_count) {
+        return UDL_SINK_ERR_TRUNCATED_COMMAND;
+    }
+
+    cursor.bytes = bitstream;
+    cursor.byte_length = (bit_count + 7u) / 8u;
+    cursor.byte_offset = start_bit_offset / 8u;
+    cursor.bit_offset = (uint8_t)(start_bit_offset % 8u);
+
+    result = udl_sink_decode_device_table_diff_internal(sink, &cursor, state_io, &diff32);
+    if (result != UDL_SINK_OK) {
+        return result;
+    }
+
+    end_bit_offset = (cursor.byte_offset * 8u) + cursor.bit_offset;
+    if (end_bit_offset > bit_count) {
+        return UDL_SINK_ERR_TRUNCATED_COMMAND;
+    }
+
+    *bit_offset_io = end_bit_offset;
+    *diff_out = (int16_t)diff32;
+    return UDL_SINK_OK;
+}
+
+static void udl_sink_load_device_table(struct udl_sink *sink,
+                                       const uint8_t *payload)
+{
+    if (!sink || !payload) {
+        return;
+    }
+
+    memcpy(sink->huffman_device_table,
+           payload,
+           UDL_CMD_E0_RECORD_COUNT * UDL_CMD_E0_RECORD_SIZE);
+    sink->huffman_device_table_signature = udl_sink_signature64(
+        sink->huffman_device_table,
+        sizeof(sink->huffman_device_table));
+    sink->huffman_device_table_loaded = true;
+    sink->huffman_device_table_matches_static =
+        sink->huffman_device_table_signature == UDL_STATIC_DEVICE_TABLE_SIGNATURE;
+
+    if (udl_sink_writecomp_debug_enabled) {
+        struct udl_sink_device_table_branch left0;
+        struct udl_sink_device_table_branch right0;
+        struct udl_sink_device_table_branch left264;
+        struct udl_sink_device_table_branch right264;
+
+        fprintf(stderr,
+                "loaded AF E0 device table sig=%llx matches_static=%s\n",
+                (unsigned long long)sink->huffman_device_table_signature,
+                sink->huffman_device_table_matches_static ? "yes" : "no");
+
+        if (udl_sink_get_device_table_branch(sink, 0u, false, &left0) &&
+            udl_sink_get_device_table_branch(sink, 0u, true, &right0) &&
+            udl_sink_get_device_table_branch(sink, 264u, false, &left264) &&
+            udl_sink_get_device_table_branch(sink, 264u, true, &right264)) {
+            uint32_t state;
+            uint32_t printed = 0u;
+
+            fprintf(stderr,
+                "AF E0 state 0: L=%s(%u,%d) R=%s(%u,%d)\n",
+                left0.is_reference ? "ref" : "term",
+                left0.is_reference ? (unsigned int)left0.reference_state : (unsigned int)left0.continuation_state,
+                left0.is_reference ? 0 : (int)left0.diff16,
+                right0.is_reference ? "ref" : "term",
+                right0.is_reference ? (unsigned int)right0.reference_state : (unsigned int)right0.continuation_state,
+                right0.is_reference ? 0 : (int)right0.diff16);
+            fprintf(stderr,
+                "AF E0 state 264: L=%s(%u,%d) R=%s(%u,%d)\n",
+                left264.is_reference ? "ref" : "term",
+                left264.is_reference ? (unsigned int)left264.reference_state : (unsigned int)left264.continuation_state,
+                left264.is_reference ? 0 : (int)left264.diff16,
+                right264.is_reference ? "ref" : "term",
+                right264.is_reference ? (unsigned int)right264.reference_state : (unsigned int)right264.continuation_state,
+                right264.is_reference ? 0 : (int)right264.diff16);
+
+            fprintf(stderr,
+                    "AF E0 candidates (L=ref256,R=term):");
+            for (state = 0u; state < 512u && printed < 16u; ++state) {
+                struct udl_sink_device_table_branch l;
+                struct udl_sink_device_table_branch r;
+
+                if (!udl_sink_get_device_table_branch(sink, (uint16_t)state, false, &l) ||
+                    !udl_sink_get_device_table_branch(sink, (uint16_t)state, true, &r)) {
+                    continue;
+                }
+                if (l.is_reference && l.reference_state == 256u && !r.is_reference) {
+                    fprintf(stderr, " %u(diff=%d,next=%u)",
+                            (unsigned int)state,
+                            (int)r.diff16,
+                            (unsigned int)r.continuation_state);
+                    printed += 1u;
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+}
 
 static size_t udl_transport_e0_command_length(const uint8_t *command, size_t length)
 {
@@ -105,6 +407,13 @@ enum udl_sink_plane {
     UDL_SINK_PLANE_8,
     UDL_SINK_PLANE_16,
 };
+
+static bool udl_sink_has_nonstatic_device_table(const struct udl_sink *sink)
+{
+    return sink &&
+           sink->huffman_device_table_loaded &&
+           !sink->huffman_device_table_matches_static;
+}
 
 static void udl_sink_huffman_init_node(struct udl_huffman_node *node)
 {
@@ -253,6 +562,7 @@ static enum udl_sink_result udl_sink_huffman_read_bit(struct udl_huffman_bitstre
                                                       uint8_t *bit_out)
 {
     uint8_t bit;
+    uint8_t current_byte;
 
     if (!bitstream || !bit_out) {
         return UDL_SINK_ERR_INVALID_ARGUMENT;
@@ -275,7 +585,8 @@ static enum udl_sink_result udl_sink_huffman_read_bit(struct udl_huffman_bitstre
         return UDL_SINK_ERR_TRUNCATED_COMMAND;
     }
 
-    bit = (uint8_t)((bitstream->bytes[bitstream->byte_offset] >> bitstream->bit_offset) & 0x01u);
+    current_byte = bitstream->bytes[bitstream->byte_offset];
+    bit = (uint8_t)((current_byte >> bitstream->bit_offset) & 0x01u);
     bitstream->bit_offset += 1u;
     if (bitstream->bit_offset == 8u) {
         bitstream->bit_offset = 0u;
@@ -290,6 +601,10 @@ static enum udl_sink_result udl_sink_huffman_read_diff(struct udl_huffman_bitstr
                                                        int32_t *diff_out)
 {
     uint32_t node_index = 0u;
+    uint32_t trace_nodes[64];
+    uint8_t trace_bits[64];
+    uint32_t trace_next[64];
+    uint32_t trace_count = 0u;
 
     if (!bitstream || !diff_out) {
         return UDL_SINK_ERR_INVALID_ARGUMENT;
@@ -321,12 +636,50 @@ static enum udl_sink_result udl_sink_huffman_read_diff(struct udl_huffman_bitstr
             enum udl_sink_result bit_result = udl_sink_huffman_read_bit(bitstream, &bit);
 
             if (bit_result != UDL_SINK_OK) {
+                if (udl_sink_writecomp_trace_first_failure_enabled &&
+                    !udl_sink_writecomp_trace_first_failure_hit) {
+                    udl_sink_writecomp_trace_first_failure_hit = true;
+                    fprintf(stderr,
+                            "writecomp trace: first failure read_bit err=%d node=%u at %zu.%u\n",
+                            (int)bit_result,
+                            (unsigned int)node_index,
+                            bitstream ? bitstream->byte_offset : 0u,
+                            bitstream ? (unsigned int)bitstream->bit_offset : 0u);
+                }
                 return bit_result;
             }
         }
 
         next_index = udl_huffman_tree.nodes[node_index].child[bit];
+        if (trace_count < 64u) {
+            trace_nodes[trace_count] = node_index;
+            trace_bits[trace_count] = bit;
+            trace_next[trace_count] = next_index;
+            trace_count += 1u;
+        }
         if (next_index == UINT32_MAX || next_index >= udl_huffman_tree.node_count) {
+            if (udl_sink_writecomp_trace_first_failure_enabled &&
+                !udl_sink_writecomp_trace_first_failure_hit) {
+            uint32_t i;
+
+                udl_sink_writecomp_trace_first_failure_hit = true;
+                fprintf(stderr,
+                "writecomp trace: first failure invalid edge node=%u bit=%u next=%u at %zu.%u steps=%u\n",
+                        (unsigned int)node_index,
+                        (unsigned int)bit,
+                        (unsigned int)next_index,
+                        bitstream ? bitstream->byte_offset : 0u,
+                bitstream ? (unsigned int)bitstream->bit_offset : 0u,
+                (unsigned int)trace_count);
+            for (i = 0u; i < trace_count; ++i) {
+                fprintf(stderr,
+                    "writecomp trace: path[%u] node=%u bit=%u next=%u\n",
+                    (unsigned int)i,
+                    (unsigned int)trace_nodes[i],
+                    (unsigned int)trace_bits[i],
+                    (unsigned int)trace_next[i]);
+            }
+            }
             return UDL_SINK_ERR_INVALID_COMMAND;
         }
 
@@ -335,6 +688,413 @@ static enum udl_sink_result udl_sink_huffman_read_diff(struct udl_huffman_bitstr
 
     *diff_out = udl_huffman_tree.nodes[node_index].diff;
     return UDL_SINK_OK;
+}
+
+static enum udl_sink_result udl_sink_huffman_probe_cursor(const struct udl_huffman_bitstream *start,
+                                                          struct udl_huffman_cursor_probe *probe)
+{
+    struct udl_huffman_bitstream cursor;
+    uint32_t node_index = 0u;
+
+    if (!start || !probe) {
+        return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    memset(probe, 0, sizeof(*probe));
+    probe->result = UDL_SINK_ERR_INVALID_ARGUMENT;
+    probe->invalid_next = UINT32_MAX;
+
+    if (!udl_sink_huffman_ensure_tree()) {
+        probe->result = UDL_SINK_ERR_NO_MEMORY;
+        return UDL_SINK_ERR_NO_MEMORY;
+    }
+
+    cursor = *start;
+
+    while (!udl_huffman_tree.nodes[node_index].leaf) {
+        uint8_t bit = 0u;
+        uint32_t next_index;
+        enum udl_sink_result bit_result = udl_sink_huffman_read_bit(&cursor, &bit);
+
+        if (bit_result != UDL_SINK_OK) {
+            probe->result = bit_result;
+            probe->end_byte_offset = cursor.byte_offset;
+            probe->end_bit_offset = cursor.bit_offset;
+            return bit_result;
+        }
+
+        next_index = udl_huffman_tree.nodes[node_index].child[bit];
+        if (next_index == UINT32_MAX || next_index >= udl_huffman_tree.node_count) {
+            probe->result = UDL_SINK_ERR_INVALID_COMMAND;
+            probe->end_byte_offset = cursor.byte_offset;
+            probe->end_bit_offset = cursor.bit_offset;
+            probe->invalid_node = node_index;
+            probe->invalid_bit = bit;
+            probe->invalid_next = next_index;
+            return UDL_SINK_ERR_INVALID_COMMAND;
+        }
+
+        node_index = next_index;
+    }
+
+    probe->result = UDL_SINK_OK;
+    probe->end_byte_offset = cursor.byte_offset;
+    probe->end_bit_offset = cursor.bit_offset;
+    return UDL_SINK_OK;
+}
+
+static void udl_sink_probe_live_diff_candidates(struct udl_sink *sink,
+                                                const struct udl_huffman_bitstream *bitstream_start)
+{
+    size_t bit_count;
+    size_t start_bit_offset;
+    uint32_t state;
+    uint32_t success_count = 0u;
+    uint32_t logged = 0u;
+
+    if (!sink || !bitstream_start || !sink->huffman_device_table_loaded ||
+        sink->huffman_device_table_matches_static) {
+        return;
+    }
+
+    bit_count = bitstream_start->byte_length * 8u;
+    start_bit_offset = (bitstream_start->byte_offset * 8u) + (size_t)bitstream_start->bit_offset;
+
+    sink->last_writecomp_live_probe_valid = false;
+    sink->last_writecomp_live_probe_successes = 0u;
+
+    fprintf(stderr,
+            "writecomp trace: live-table probe at bit %zu (sig=%llx)\n",
+            start_bit_offset,
+            (unsigned long long)sink->huffman_device_table_signature);
+
+    for (state = 0u; state < 512u; ++state) {
+        uint16_t state_io = (uint16_t)state;
+        size_t bit_offset = start_bit_offset;
+        int16_t diff16 = 0;
+        enum udl_sink_result result = udl_sink_decode_device_table_diff(sink,
+                                                                         &state_io,
+                                                                         bitstream_start->bytes,
+                                                                         bit_count,
+                                                                         &bit_offset,
+                                                                         &diff16);
+
+        if (result != UDL_SINK_OK) {
+            continue;
+        }
+
+        success_count += 1u;
+        if (logged < 8u) {
+            fprintf(stderr,
+                    "writecomp trace: live ok state=%u diff=%d bits=%zu next_state=%u\n",
+                    (unsigned int)state,
+                    (int)diff16,
+                    bit_offset - start_bit_offset,
+                    (unsigned int)state_io);
+            logged += 1u;
+        }
+    }
+
+    fprintf(stderr,
+            "writecomp trace: live probe successes=%u/512\n",
+            (unsigned int)success_count);
+
+    sink->last_writecomp_live_probe_valid = true;
+    sink->last_writecomp_live_probe_successes = (uint16_t)success_count;
+}
+
+static bool udl_sink_writecomp_trace_visible_pixel_matches(uint32_t first_visible_pixel,
+                                                           uint32_t visible_pixel_count,
+                                                           uint32_t skip_pixels,
+                                                           uint32_t produced,
+                                                           uint32_t *visible_pixel_out)
+{
+    uint32_t local_visible_index;
+
+    if (!udl_sink_writecomp_trace_visible_pixel_enabled ||
+        udl_sink_writecomp_trace_visible_pixel_hit ||
+        visible_pixel_count == 0u ||
+        produced < skip_pixels) {
+        return false;
+    }
+
+    local_visible_index = produced - skip_pixels;
+    if (local_visible_index >= visible_pixel_count) {
+        return false;
+    }
+
+    if (first_visible_pixel + local_visible_index != udl_sink_writecomp_trace_visible_pixel) {
+        return false;
+    }
+
+    if (visible_pixel_out) {
+        *visible_pixel_out = first_visible_pixel + local_visible_index;
+    }
+
+    return true;
+}
+
+static enum udl_sink_result udl_sink_read_diff_for_writecomp(struct udl_sink *sink,
+                                                             struct udl_huffman_bitstream *bitstream,
+                                                             uint16_t *device_state_io,
+                                                             int32_t *diff_out)
+{
+    if (udl_sink_writecomp_hybrid_static_live_enabled &&
+        sink &&
+        udl_sink_has_nonstatic_device_table(sink)) {
+        struct udl_huffman_bitstream start = *bitstream;
+        enum udl_sink_result static_result = udl_sink_huffman_read_diff(bitstream, diff_out);
+
+        if (static_result == UDL_SINK_OK) {
+            return UDL_SINK_OK;
+        }
+
+        if (static_result == UDL_SINK_ERR_INVALID_COMMAND) {
+            struct udl_huffman_bitstream live_stream = start;
+            size_t bit_offset = (live_stream.byte_offset * 8u) + (size_t)live_stream.bit_offset;
+            size_t bit_count = live_stream.byte_length * 8u;
+            int16_t diff16 = 0;
+            uint16_t live_state = *device_state_io;
+            enum udl_sink_result live_result = udl_sink_decode_device_table_diff(sink,
+                                                                                  &live_state,
+                                                                                  live_stream.bytes,
+                                                                                  bit_count,
+                                                                                  &bit_offset,
+                                                                                  &diff16);
+
+            if (live_result == UDL_SINK_OK) {
+                bitstream->byte_offset = bit_offset / 8u;
+                bitstream->bit_offset = (uint8_t)(bit_offset % 8u);
+                *device_state_io = live_state;
+                *diff_out = (int32_t)diff16;
+                return UDL_SINK_OK;
+            }
+        }
+
+        return static_result;
+    }
+
+    if (udl_sink_writecomp_live_table_decode_enabled && udl_sink_has_nonstatic_device_table(sink)) {
+        size_t bit_offset;
+        size_t bit_count;
+        int16_t diff16;
+        enum udl_sink_result result;
+
+        if (!bitstream || !device_state_io || !diff_out) {
+            return UDL_SINK_ERR_INVALID_ARGUMENT;
+        }
+
+        bit_offset = (bitstream->byte_offset * 8u) + (size_t)bitstream->bit_offset;
+        bit_count = bitstream->byte_length * 8u;
+
+        result = udl_sink_decode_device_table_diff(sink,
+                                                   device_state_io,
+                                                   bitstream->bytes,
+                                                   bit_count,
+                                                   &bit_offset,
+                                                   &diff16);
+        if (result != UDL_SINK_OK) {
+            return result;
+        }
+
+        bitstream->byte_offset = bit_offset / 8u;
+        bitstream->bit_offset = (uint8_t)(bit_offset % 8u);
+        *diff_out = (int32_t)diff16;
+        return UDL_SINK_OK;
+    }
+
+    {
+        struct udl_huffman_bitstream start = *bitstream;
+        enum udl_sink_result result = udl_sink_huffman_read_diff(bitstream, diff_out);
+
+        if (sink) {
+            sink->last_writecomp_static_probe_valid = false;
+            sink->last_writecomp_static_probe_matches_decoder = false;
+            sink->last_writecomp_static_probe_result = (int)UDL_SINK_OK;
+            sink->last_writecomp_static_probe_end_byte_offset = 0u;
+            sink->last_writecomp_static_probe_end_bit_offset = 0u;
+            sink->last_writecomp_static_probe_invalid_node = 0u;
+            sink->last_writecomp_static_probe_invalid_bit = 0u;
+            sink->last_writecomp_static_probe_invalid_next = UINT32_MAX;
+        }
+
+        if (result != UDL_SINK_OK && sink) {
+            struct udl_huffman_cursor_probe probe;
+            enum udl_sink_result probe_result = udl_sink_huffman_probe_cursor(&start, &probe);
+
+            sink->last_writecomp_static_probe_valid = true;
+            sink->last_writecomp_static_probe_result = (int)probe.result;
+            sink->last_writecomp_static_probe_end_byte_offset = probe.end_byte_offset;
+            sink->last_writecomp_static_probe_end_bit_offset = probe.end_bit_offset;
+            sink->last_writecomp_static_probe_invalid_node = probe.invalid_node;
+            sink->last_writecomp_static_probe_invalid_bit = probe.invalid_bit;
+            sink->last_writecomp_static_probe_invalid_next = probe.invalid_next;
+            sink->last_writecomp_static_probe_matches_decoder =
+                (probe_result == result) &&
+                (probe.end_byte_offset == bitstream->byte_offset) &&
+                (probe.end_bit_offset == bitstream->bit_offset);
+        }
+
+        if (result == UDL_SINK_ERR_INVALID_COMMAND &&
+            udl_sink_writecomp_trace_first_failure_enabled &&
+            udl_sink_writecomp_trace_first_failure_hit &&
+            !udl_sink_writecomp_trace_first_failure_probe_done) {
+            udl_sink_writecomp_trace_first_failure_probe_done = true;
+            udl_sink_probe_live_diff_candidates(sink, &start);
+        }
+
+        return result;
+    }
+}
+
+static enum udl_sink_result udl_sink_decode_writecomp_zerokvm(struct udl_sink *sink,
+                                                              enum udl_sink_plane plane,
+                                                              struct udl_huffman_bitstream *bitstream,
+                                                              uint32_t pixel_count,
+                                                              uint16_t *decoded16,
+                                                              uint8_t *decoded8,
+                                                              uint16_t *device_state_out)
+{
+    const uint16_t start_state = plane == UDL_SINK_PLANE_16 ? 8u : 0u;
+    uint16_t state = start_state;
+    uint32_t accumulator = 0u;
+    uint32_t produced = 0u;
+
+    if (!sink || !bitstream || !device_state_out) {
+        return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    while (produced < pixel_count) {
+        uint8_t bits;
+        uint32_t step;
+
+        if (bitstream->byte_offset >= bitstream->byte_length) {
+            return UDL_SINK_ERR_TRUNCATED_COMMAND;
+        }
+
+        bits = bitstream->bytes[bitstream->byte_offset];
+        bitstream->byte_offset += 1u;
+
+        for (step = 0u; step < 8u && produced < pixel_count; ++step) {
+            struct udl_sink_zerokvm_branch branch;
+
+            if (!udl_sink_get_device_table_zerokvm_branch(sink,
+                                                          state,
+                                                          (bits & 1u) != 0u,
+                                                          &branch)) {
+                return UDL_SINK_ERR_INVALID_COMMAND;
+            }
+
+            accumulator = (accumulator + branch.color) & 0xffffu;
+            state = branch.jump;
+            bits >>= 1u;
+
+            if (state == 0u) {
+                if (plane == UDL_SINK_PLANE_16) {
+                    decoded16[produced] = (uint16_t)accumulator;
+                } else {
+                    decoded8[produced] = (uint8_t)accumulator;
+                }
+                produced += 1u;
+                state = start_state;
+            }
+        }
+    }
+
+    bitstream->bit_offset = 0u;
+    *device_state_out = state;
+    return UDL_SINK_OK;
+}
+
+static enum udl_sink_result udl_sink_huffman_read_diff_traced(struct udl_huffman_bitstream *bitstream,
+                                                              int32_t *diff_out)
+{
+    uint32_t node_index = 0u;
+    uint32_t step = 0u;
+
+    if (!bitstream || !diff_out) {
+        return UDL_SINK_ERR_INVALID_ARGUMENT;
+    }
+
+    if (!udl_sink_huffman_ensure_tree()) {
+        return UDL_SINK_ERR_NO_MEMORY;
+    }
+
+    fprintf(stderr,
+            "writecomp trace: begin static diff decode at %zu.%u\n",
+            bitstream->byte_offset,
+            (unsigned int)bitstream->bit_offset);
+
+    while (!udl_huffman_tree.nodes[node_index].leaf) {
+        uint8_t bit = 0u;
+        uint32_t next_index;
+        enum udl_sink_result bit_result = udl_sink_huffman_read_bit(bitstream, &bit);
+
+        if (bit_result != UDL_SINK_OK) {
+            fprintf(stderr,
+                    "writecomp trace: read_bit failed step=%u node=%u err=%d at %zu.%u\n",
+                    (unsigned int)step,
+                    (unsigned int)node_index,
+                    (int)bit_result,
+                    bitstream->byte_offset,
+                    (unsigned int)bitstream->bit_offset);
+            return bit_result;
+        }
+
+        next_index = udl_huffman_tree.nodes[node_index].child[bit];
+        fprintf(stderr,
+                "writecomp trace: step=%u node=%u bit=%u next=%u at %zu.%u\n",
+                (unsigned int)step,
+                (unsigned int)node_index,
+                (unsigned int)bit,
+                (unsigned int)next_index,
+                bitstream->byte_offset,
+                (unsigned int)bitstream->bit_offset);
+
+        if (next_index == UINT32_MAX || next_index >= udl_huffman_tree.node_count) {
+            fprintf(stderr,
+                    "writecomp trace: invalid edge step=%u node=%u bit=%u\n",
+                    (unsigned int)step,
+                    (unsigned int)node_index,
+                    (unsigned int)bit);
+            return UDL_SINK_ERR_INVALID_COMMAND;
+        }
+
+        node_index = next_index;
+        step += 1u;
+    }
+
+    *diff_out = udl_huffman_tree.nodes[node_index].diff;
+    fprintf(stderr,
+            "writecomp trace: leaf node=%u diff=%d end=%zu.%u\n",
+            (unsigned int)node_index,
+            (int)*diff_out,
+            bitstream->byte_offset,
+            (unsigned int)bitstream->bit_offset);
+    return UDL_SINK_OK;
+}
+
+static void udl_sink_record_writecomp_error(struct udl_sink *sink,
+                                            uint8_t command_type,
+                                            uint32_t pixel_index,
+                                            const struct udl_huffman_bitstream *bitstream,
+                                            uint16_t device_state,
+                                            enum udl_sink_result result)
+{
+    if (!sink || !bitstream) {
+        return;
+    }
+
+    sink->last_writecomp_error_valid = true;
+    sink->last_writecomp_error_command = command_type;
+    sink->last_writecomp_error_pixel_index = pixel_index;
+    sink->last_writecomp_error_byte_offset = bitstream->byte_offset;
+    sink->last_writecomp_error_bit_offset = bitstream->bit_offset;
+    sink->last_writecomp_error_state =
+        udl_sink_writecomp_live_table_decode_enabled && udl_sink_has_nonstatic_device_table(sink)
+            ? device_state
+            : UINT16_MAX;
+    sink->last_writecomp_error_result = (int)result;
 }
 
 static bool udl_sink_fast_path_16bpp_enabled(const struct udl_sink *sink);
@@ -653,8 +1413,10 @@ static enum udl_stream_parse_result udl_transport_next_command_length(const uint
                                                                       size_t length,
                                                                       size_t *command_len_out);
 
-static enum udl_stream_parse_result udl_transport_probe_writecomp_candidate(const uint8_t *command,
-                                                                             size_t length)
+static enum udl_stream_parse_result udl_transport_probe_writecomp_candidate(const struct udl_sink *sink,
+                                                                             const uint8_t *command,
+                                                                             size_t length,
+                                                                             bool allow_live_structural)
 {
     struct udl_huffman_bitstream bitstream;
     uint32_t pixel_count;
@@ -677,6 +1439,17 @@ static enum udl_stream_parse_result udl_transport_probe_writecomp_candidate(cons
     pixel_count = udl_sink_count_from_byte(command[5]);
     if (pixel_count == 0u) {
         return UDL_STREAM_PARSE_INVALID;
+    }
+
+    if (allow_live_structural && udl_sink_has_nonstatic_device_table(sink)) {
+        /* Once a live AF E0 table is loaded, the old compact-table probe is
+         * no longer a sound validator for AF70/AF78 payloads. Keep probing
+         * structural only for the current command so transport does not reject
+         * real live-table writecomp traffic at the head of the pending buffer.
+         * Scan-ahead and trailer detection stay strict to avoid false AF70/78
+         * re-locks inside compressed payload tails.
+         */
+        return UDL_STREAM_PARSE_COMPLETE;
     }
 
     probe_pixels = pixel_count;
@@ -723,8 +1496,10 @@ static enum udl_stream_parse_result udl_transport_probe_writecomp_candidate(cons
     return UDL_STREAM_PARSE_COMPLETE;
 }
 
-static enum udl_stream_parse_result udl_transport_probe_command_candidate(const uint8_t *command,
-                                                                          size_t length)
+static enum udl_stream_parse_result udl_transport_probe_command_candidate(const struct udl_sink *sink,
+                                                                          const uint8_t *command,
+                                                                          size_t length,
+                                                                          bool allow_live_structural)
 {
     size_t command_len = 0u;
 
@@ -733,7 +1508,10 @@ static enum udl_stream_parse_result udl_transport_probe_command_candidate(const 
     }
 
     if (command[1] == UDL_CMD_WRITECOMP8 || command[1] == UDL_CMD_WRITECOMP16) {
-        return udl_transport_probe_writecomp_candidate(command, length);
+        return udl_transport_probe_writecomp_candidate(sink,
+                                                       command,
+                                                       length,
+                                                       allow_live_structural);
     }
 
     return udl_transport_next_command_length(command, length, &command_len);
@@ -864,7 +1642,8 @@ static bool udl_transport_command_plausible_for_sink(const struct udl_sink *sink
     }
 }
 
-static bool udl_transport_find_next_command_mode(const uint8_t *buffer,
+static bool udl_transport_find_next_command_mode(const struct udl_sink *sink,
+                                                 const uint8_t *buffer,
                                                  size_t length,
                                                  size_t *offset_out,
                                                  bool *needs_more_out,
@@ -894,7 +1673,10 @@ static bool udl_transport_find_next_command_mode(const uint8_t *buffer,
 
         if (udl_transport_is_known_command_type(buffer[offset + 1u])) {
             enum udl_stream_parse_result probe_result =
-                udl_transport_probe_command_candidate(buffer + offset, length - offset);
+                udl_transport_probe_command_candidate(sink,
+                                                      buffer + offset,
+                                                      length - offset,
+                                                      false);
 
             if (probe_result == UDL_STREAM_PARSE_COMPLETE) {
                 *offset_out = offset;
@@ -990,8 +1772,10 @@ static bool udl_transport_find_next_register_anchor(const struct udl_sink *sink,
                 continue;
             }
 
-            parse_result = udl_transport_probe_command_candidate(buffer + offset + anchor_len,
-                                                                 length - offset - anchor_len);
+            parse_result = udl_transport_probe_command_candidate(sink,
+                                                                 buffer + offset + anchor_len,
+                                                                 length - offset - anchor_len,
+                                                                 false);
             if (parse_result == UDL_STREAM_PARSE_NEED_MORE) {
                 *offset_out = offset;
                 *needs_more_out = true;
@@ -1023,31 +1807,36 @@ static bool udl_transport_find_next_register_anchor(const struct udl_sink *sink,
     return false;
 }
 
-static bool udl_transport_find_next_command(const uint8_t *buffer,
+static bool udl_transport_find_next_command(const struct udl_sink *sink,
+                                            const uint8_t *buffer,
                                             size_t length,
                                             size_t *offset_out,
                                             bool *needs_more_out)
 {
-    return udl_transport_find_next_command_mode(buffer,
+    return udl_transport_find_next_command_mode(sink,
+                                                buffer,
                                                 length,
                                                 offset_out,
                                                 needs_more_out,
                                                 true);
 }
 
-static bool udl_transport_find_next_command_strict(const uint8_t *buffer,
+static bool udl_transport_find_next_command_strict(const struct udl_sink *sink,
+                                                   const uint8_t *buffer,
                                                    size_t length,
                                                    size_t *offset_out,
                                                    bool *needs_more_out)
 {
-    return udl_transport_find_next_command_mode(buffer,
+    return udl_transport_find_next_command_mode(sink,
+                                                buffer,
                                                 length,
                                                 offset_out,
                                                 needs_more_out,
                                                 false);
 }
 
-static bool udl_transport_find_next_framebuffer_command_strict(const uint8_t *buffer,
+static bool udl_transport_find_next_framebuffer_command_strict(const struct udl_sink *sink,
+                                                               const uint8_t *buffer,
                                                                size_t length,
                                                                size_t *offset_out,
                                                                bool *needs_more_out)
@@ -1082,7 +1871,10 @@ static bool udl_transport_find_next_framebuffer_command_strict(const uint8_t *bu
             continue;
         }
 
-        probe_result = udl_transport_probe_command_candidate(buffer + offset, length - offset);
+        probe_result = udl_transport_probe_command_candidate(sink,
+                                                             buffer + offset,
+                                                             length - offset,
+                                                             false);
         if (probe_result == UDL_STREAM_PARSE_COMPLETE) {
             *offset_out = offset;
             return true;
@@ -1566,6 +2358,60 @@ static void udl_transport_record_first_resync(struct udl_transport *transport,
     }
 }
 
+static void udl_transport_record_first_error(struct udl_transport *transport,
+                                             enum udl_transport_error_stage stage,
+                                             uint8_t command_type,
+                                             enum udl_sink_result sink_result,
+                                             size_t consumed)
+{
+    if (!transport || transport->last_feed_first_error_valid) {
+        return;
+    }
+
+    transport->last_feed_first_error_valid = true;
+    transport->last_feed_first_error_stage = stage;
+    transport->last_feed_first_error_command_type = command_type;
+    transport->last_feed_first_error_sink_result = (int)sink_result;
+    transport->last_feed_first_error_consumed = consumed;
+
+    if (stage == UDL_TRANSPORT_ERROR_WRITECOMP_DECODE &&
+        transport->sink && transport->sink->last_writecomp_error_valid) {
+        transport->last_feed_first_error_writecomp_valid = true;
+        transport->last_feed_first_error_writecomp_command =
+            transport->sink->last_writecomp_error_command;
+        transport->last_feed_first_error_writecomp_result =
+            transport->sink->last_writecomp_error_result;
+        transport->last_feed_first_error_writecomp_pixel_index =
+            transport->sink->last_writecomp_error_pixel_index;
+        transport->last_feed_first_error_writecomp_byte_offset =
+            transport->sink->last_writecomp_error_byte_offset;
+        transport->last_feed_first_error_writecomp_bit_offset =
+            transport->sink->last_writecomp_error_bit_offset;
+        transport->last_feed_first_error_writecomp_state =
+            transport->sink->last_writecomp_error_state;
+        transport->last_feed_first_error_writecomp_live_probe_valid =
+            transport->sink->last_writecomp_live_probe_valid;
+        transport->last_feed_first_error_writecomp_live_probe_successes =
+            transport->sink->last_writecomp_live_probe_successes;
+        transport->last_feed_first_error_writecomp_static_probe_valid =
+            transport->sink->last_writecomp_static_probe_valid;
+        transport->last_feed_first_error_writecomp_static_probe_matches_decoder =
+            transport->sink->last_writecomp_static_probe_matches_decoder;
+        transport->last_feed_first_error_writecomp_static_probe_result =
+            transport->sink->last_writecomp_static_probe_result;
+        transport->last_feed_first_error_writecomp_static_probe_end_byte_offset =
+            transport->sink->last_writecomp_static_probe_end_byte_offset;
+        transport->last_feed_first_error_writecomp_static_probe_end_bit_offset =
+            transport->sink->last_writecomp_static_probe_end_bit_offset;
+        transport->last_feed_first_error_writecomp_static_probe_invalid_node =
+            transport->sink->last_writecomp_static_probe_invalid_node;
+        transport->last_feed_first_error_writecomp_static_probe_invalid_bit =
+            transport->sink->last_writecomp_static_probe_invalid_bit;
+        transport->last_feed_first_error_writecomp_static_probe_invalid_next =
+            transport->sink->last_writecomp_static_probe_invalid_next;
+    }
+}
+
 static void udl_transport_begin_writecomp_quarantine(struct udl_transport *transport)
 {
     if (!transport) {
@@ -1713,7 +2559,10 @@ static bool udl_sink_ensure_rgb565_lookup(struct udl_sink *sink)
         const uint8_t green = udl_sink_expand6_to8((uint8_t)((pixel >> 5) & 0x3fu));
         const uint8_t blue = udl_sink_expand5_to8((uint8_t)(pixel & 0x1fu));
 
-        lookup[pixel] = 0xff000000u | ((uint32_t)red << 16) | ((uint32_t)green << 8) | blue;
+        lookup[pixel] = 0xff000000u |
+                        ((uint32_t)red << 16) |
+                        ((uint32_t)green << 8) |
+                        (uint32_t)blue;
     }
 
     sink->rgb565_to_xrgb8888_lookup = lookup;
@@ -2533,6 +3382,11 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
     const uint64_t visible_limit = visible_base + ((uint64_t)sink->plane_pixels * bytes_per_pixel);
     const uint64_t command_byte_start = (uint64_t)byte_address;
     const uint64_t command_byte_limit = command_byte_start + ((uint64_t)pixel_count * bytes_per_pixel);
+    const bool use_zerokvm_live_table =
+        sink &&
+        udl_sink_writecomp_live_table_decode_enabled &&
+        udl_sink_writecomp_live_table_zerokvm_enabled &&
+        udl_sink_has_nonstatic_device_table(sink);
     enum udl_sink_result map_result;
     struct udl_huffman_bitstream bitstream;
     enum udl_sink_result result;
@@ -2542,9 +3396,84 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
     uint32_t visible_pixel_count = 0u;
     uint32_t skip_pixels = 0u;
     uint32_t produced;
+    uint16_t device_state = 0u;
+    uint16_t initial_pixel16 = 0u;
+    uint8_t initial_pixel8 = 0u;
+    bool live_no_change_bit = false;
+    bool state_seeded = false;
+    const bool use_live_table_state =
+        udl_sink_writecomp_live_table_decode_enabled ||
+        udl_sink_writecomp_hybrid_static_live_enabled;
 
     if (consumed) {
         *consumed = 0u;
+    }
+
+    if (sink) {
+        sink->last_writecomp_error_valid = false;
+        sink->last_writecomp_live_probe_valid = false;
+        sink->last_writecomp_live_probe_successes = 0u;
+        sink->last_writecomp_static_probe_valid = false;
+        sink->last_writecomp_static_probe_matches_decoder = false;
+        sink->last_writecomp_static_probe_result = (int)UDL_SINK_OK;
+        sink->last_writecomp_static_probe_end_byte_offset = 0u;
+        sink->last_writecomp_static_probe_end_bit_offset = 0u;
+        sink->last_writecomp_static_probe_invalid_node = 0u;
+        sink->last_writecomp_static_probe_invalid_bit = 0u;
+        sink->last_writecomp_static_probe_invalid_next = UINT32_MAX;
+
+        if (use_live_table_state &&
+            udl_sink_writecomp_live_table_state_carry_enabled &&
+            udl_sink_has_nonstatic_device_table(sink)) {
+            if (udl_sink_writecomp_live_table_state_global_enabled &&
+                sink->writecomp_live_state_valid_global) {
+                device_state = sink->writecomp_live_state_global;
+                state_seeded = true;
+            } else if (plane == UDL_SINK_PLANE_16 && sink->writecomp_live_state_valid16) {
+                device_state = sink->writecomp_live_state16;
+                state_seeded = true;
+            } else if (plane == UDL_SINK_PLANE_8 && sink->writecomp_live_state_valid8) {
+                device_state = sink->writecomp_live_state8;
+                state_seeded = true;
+            }
+        }
+
+        if (!state_seeded &&
+            use_live_table_state &&
+            udl_sink_has_nonstatic_device_table(sink)) {
+            if (plane == UDL_SINK_PLANE_16 && udl_sink_writecomp_live_table_state_seed16_enabled) {
+                device_state = udl_sink_writecomp_live_table_state_seed16;
+                state_seeded = true;
+            } else if (plane == UDL_SINK_PLANE_8 && udl_sink_writecomp_live_table_state_seed8_enabled) {
+                device_state = udl_sink_writecomp_live_table_state_seed8;
+                state_seeded = true;
+            } else if (udl_sink_writecomp_live_table_state_seed_enabled) {
+                device_state = udl_sink_writecomp_live_table_state_seed;
+                state_seeded = true;
+            }
+        }
+
+        if (!use_zerokvm_live_table &&
+            udl_sink_writecomp_live_table_decode_enabled &&
+            udl_sink_writecomp_live_table_pixel_carry_enabled &&
+            udl_sink_has_nonstatic_device_table(sink)) {
+            if (udl_sink_writecomp_live_table_state_global_enabled &&
+                sink->writecomp_live_pixel_valid_global) {
+                initial_pixel16 = sink->writecomp_live_pixel_global;
+                initial_pixel8 = (uint8_t)sink->writecomp_live_pixel_global;
+            } else if (plane == UDL_SINK_PLANE_16 && sink->writecomp_live_pixel_valid16) {
+                initial_pixel16 = sink->writecomp_live_pixel16;
+            } else if (plane == UDL_SINK_PLANE_8 && sink->writecomp_live_pixel_valid8) {
+                initial_pixel8 = sink->writecomp_live_pixel8;
+            }
+        }
+
+        if (!use_zerokvm_live_table &&
+            udl_sink_writecomp_live_table_decode_enabled &&
+            udl_sink_writecomp_live_table_no_change_bit_enabled &&
+            udl_sink_has_nonstatic_device_table(sink)) {
+            live_no_change_bit = true;
+        }
     }
 
     if (remaining < 6u) {
@@ -2610,36 +3539,144 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
     bitstream.byte_offset = 0u;
     bitstream.bit_offset = 0u;
 
-    if (plane == UDL_SINK_PLANE_16) {
-        uint16_t previous_pixel = 0u;
+    if (use_zerokvm_live_table) {
+        device_state = plane == UDL_SINK_PLANE_16 ? 8u : 0u;
+        result = udl_sink_decode_writecomp_zerokvm(sink,
+                                                   plane,
+                                                   &bitstream,
+                                                   pixel_count,
+                                                   decoded16,
+                                                   decoded8,
+                                                   &device_state);
+        if (result != UDL_SINK_OK) {
+            udl_sink_record_writecomp_error(sink,
+                                            command[1],
+                                            0u,
+                                            &bitstream,
+                                            device_state,
+                                            result);
+            if (consumed) {
+                *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+            }
+            return result;
+        }
+
+        if (plane == UDL_SINK_PLANE_16) {
+            uint32_t visible_index;
+
+            for (visible_index = 0u; visible_index < visible_pixel_count; ++visible_index) {
+                udl_sink_write_plane16(sink,
+                                       first_visible_pixel + visible_index,
+                                       decoded16[skip_pixels + visible_index],
+                                       damage);
+            }
+        } else {
+            uint32_t visible_index;
+
+            for (visible_index = 0u; visible_index < visible_pixel_count; ++visible_index) {
+                udl_sink_write_plane8(sink,
+                                      first_visible_pixel + visible_index,
+                                      decoded8[skip_pixels + visible_index],
+                                      damage);
+            }
+        }
+    } else if (plane == UDL_SINK_PLANE_16) {
+        uint16_t previous_pixel = initial_pixel16;
         uint32_t visible_index;
 
         for (produced = 0u; produced < pixel_count; ++produced) {
             int32_t diff;
             uint8_t change = 0u;
             uint16_t pixel;
+            bool trace_visible_pixel = false;
+            uint32_t trace_visible_index = 0u;
 
-            result = udl_sink_huffman_read_bit(&bitstream, &change);
-            if (result != UDL_SINK_OK) {
-                if (consumed) {
-                    *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+            trace_visible_pixel = udl_sink_writecomp_trace_visible_pixel_matches(first_visible_pixel,
+                                                                                 visible_pixel_count,
+                                                                                 skip_pixels,
+                                                                                 produced,
+                                                                                 &trace_visible_index);
+
+            if (trace_visible_pixel) {
+                fprintf(stderr,
+                        "writecomp pixel trace: begin cmd=0x%02x visible_pixel=%u produced=%u start=%zu.%u state=%u prev16=0x%04x\n",
+                        (unsigned int)command[1],
+                        (unsigned int)trace_visible_index,
+                        (unsigned int)produced,
+                        bitstream.byte_offset,
+                        (unsigned int)bitstream.bit_offset,
+                        (unsigned int)device_state,
+                        (unsigned int)previous_pixel);
+            }
+
+            if (!live_no_change_bit) {
+                result = udl_sink_huffman_read_bit(&bitstream, &change);
+                if (result != UDL_SINK_OK) {
+                    udl_sink_record_writecomp_error(sink,
+                                                    command[1],
+                                                    produced,
+                                                    &bitstream,
+                                                    device_state,
+                                                    result);
+                    if (consumed) {
+                        *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+                    }
+                    if (udl_sink_writecomp_debug_enabled) {
+                        fprintf(stderr,
+                                "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
+                                (unsigned int)command[1],
+                                (unsigned int)produced,
+                                (unsigned int)pixel_count,
+                                bitstream.byte_offset,
+                                (unsigned int)bitstream.bit_offset,
+                                (int)result);
+                    }
+                    return result;
                 }
-                if (udl_sink_writecomp_debug_enabled) {
-                    fprintf(stderr,
-                            "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
-                            (unsigned int)command[1],
-                            (unsigned int)produced,
-                            (unsigned int)pixel_count,
-                            bitstream.byte_offset,
-                            (unsigned int)bitstream.bit_offset,
-                            (int)result);
-                }
-                return result;
+            } else {
+                change = 1u;
+            }
+
+            if (trace_visible_pixel) {
+                fprintf(stderr,
+                        "writecomp pixel trace: after-change cmd=0x%02x visible_pixel=%u change=%u cursor=%zu.%u state=%u\n",
+                        (unsigned int)command[1],
+                        (unsigned int)trace_visible_index,
+                        (unsigned int)change,
+                        bitstream.byte_offset,
+                        (unsigned int)bitstream.bit_offset,
+                        (unsigned int)device_state);
             }
 
             if (change != 0u) {
-                result = udl_sink_huffman_read_diff(&bitstream, &diff);
+                if (udl_sink_writecomp_trace_target_enabled &&
+                    !udl_sink_writecomp_trace_target_hit &&
+                    !udl_sink_writecomp_live_table_decode_enabled &&
+                    command[1] == udl_sink_writecomp_trace_target_command &&
+                    produced == udl_sink_writecomp_trace_target_pixel &&
+                    bitstream.byte_offset == udl_sink_writecomp_trace_target_byte &&
+                    bitstream.bit_offset == udl_sink_writecomp_trace_target_bit) {
+                    udl_sink_writecomp_trace_target_hit = true;
+                    fprintf(stderr,
+                            "writecomp trace: trigger cmd=0x%02x pix=%u at %zu.%u\n",
+                            (unsigned int)command[1],
+                            (unsigned int)produced,
+                            bitstream.byte_offset,
+                            (unsigned int)bitstream.bit_offset);
+                    result = udl_sink_huffman_read_diff_traced(&bitstream, &diff);
+                } else {
+                    result = udl_sink_read_diff_for_writecomp(sink,
+                                                              &bitstream,
+                                                              &device_state,
+                                                              &diff);
+                }
                 if (result != UDL_SINK_OK) {
+                    udl_sink_record_writecomp_error(sink,
+                                                    command[1],
+                                                    produced,
+                                                    &bitstream,
+                                                    device_state,
+                                                    result);
                     if (consumed) {
                         *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
                     }
@@ -2661,6 +3698,19 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
                 pixel = previous_pixel;
             }
 
+            if (trace_visible_pixel) {
+                fprintf(stderr,
+                        "writecomp pixel trace: result cmd=0x%02x visible_pixel=%u diff=%d pixel16=0x%04x end=%zu.%u state=%u\n",
+                        (unsigned int)command[1],
+                        (unsigned int)trace_visible_index,
+                        (int)(change != 0u ? diff : 0),
+                        (unsigned int)pixel,
+                        bitstream.byte_offset,
+                        (unsigned int)bitstream.bit_offset,
+                        (unsigned int)device_state);
+                udl_sink_writecomp_trace_visible_pixel_hit = true;
+            }
+
             decoded16[produced] = pixel;
             previous_pixel = pixel;
         }
@@ -2672,35 +3722,102 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
                                    damage);
         }
     } else {
-        uint8_t previous_pixel = 0u;
+        uint8_t previous_pixel = initial_pixel8;
         uint32_t visible_index;
 
         for (produced = 0u; produced < pixel_count; ++produced) {
             int32_t diff;
             uint8_t change = 0u;
             uint8_t pixel;
+            bool trace_visible_pixel = false;
+            uint32_t trace_visible_index = 0u;
 
-            result = udl_sink_huffman_read_bit(&bitstream, &change);
-            if (result != UDL_SINK_OK) {
-                if (consumed) {
-                    *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+            trace_visible_pixel = udl_sink_writecomp_trace_visible_pixel_matches(first_visible_pixel,
+                                                                                 visible_pixel_count,
+                                                                                 skip_pixels,
+                                                                                 produced,
+                                                                                 &trace_visible_index);
+
+            if (trace_visible_pixel) {
+                fprintf(stderr,
+                        "writecomp pixel trace: begin cmd=0x%02x visible_pixel=%u produced=%u start=%zu.%u state=%u prev8=0x%02x\n",
+                        (unsigned int)command[1],
+                        (unsigned int)trace_visible_index,
+                        (unsigned int)produced,
+                        bitstream.byte_offset,
+                        (unsigned int)bitstream.bit_offset,
+                        (unsigned int)device_state,
+                        (unsigned int)previous_pixel);
+            }
+
+            if (!live_no_change_bit) {
+                result = udl_sink_huffman_read_bit(&bitstream, &change);
+                if (result != UDL_SINK_OK) {
+                    udl_sink_record_writecomp_error(sink,
+                                                    command[1],
+                                                    produced,
+                                                    &bitstream,
+                                                    device_state,
+                                                    result);
+                    if (consumed) {
+                        *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
+                    }
+                    if (udl_sink_writecomp_debug_enabled) {
+                        fprintf(stderr,
+                                "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
+                                (unsigned int)command[1],
+                                (unsigned int)produced,
+                                (unsigned int)pixel_count,
+                                bitstream.byte_offset,
+                                (unsigned int)bitstream.bit_offset,
+                                (int)result);
+                    }
+                    return result;
                 }
-                if (udl_sink_writecomp_debug_enabled) {
-                    fprintf(stderr,
-                            "writecomp huff fail cmd=0x%02x produced=%u/%u byte_off=%zu bit_off=%u err=%d\\n",
-                            (unsigned int)command[1],
-                            (unsigned int)produced,
-                            (unsigned int)pixel_count,
-                            bitstream.byte_offset,
-                            (unsigned int)bitstream.bit_offset,
-                            (int)result);
-                }
-                return result;
+            } else {
+                change = 1u;
+            }
+
+            if (trace_visible_pixel) {
+                fprintf(stderr,
+                        "writecomp pixel trace: after-change cmd=0x%02x visible_pixel=%u change=%u cursor=%zu.%u state=%u\n",
+                        (unsigned int)command[1],
+                        (unsigned int)trace_visible_index,
+                        (unsigned int)change,
+                        bitstream.byte_offset,
+                        (unsigned int)bitstream.bit_offset,
+                        (unsigned int)device_state);
             }
 
             if (change != 0u) {
-                result = udl_sink_huffman_read_diff(&bitstream, &diff);
+                if (udl_sink_writecomp_trace_target_enabled &&
+                    !udl_sink_writecomp_trace_target_hit &&
+                    !udl_sink_writecomp_live_table_decode_enabled &&
+                    command[1] == udl_sink_writecomp_trace_target_command &&
+                    produced == udl_sink_writecomp_trace_target_pixel &&
+                    bitstream.byte_offset == udl_sink_writecomp_trace_target_byte &&
+                    bitstream.bit_offset == udl_sink_writecomp_trace_target_bit) {
+                    udl_sink_writecomp_trace_target_hit = true;
+                    fprintf(stderr,
+                            "writecomp trace: trigger cmd=0x%02x pix=%u at %zu.%u\n",
+                            (unsigned int)command[1],
+                            (unsigned int)produced,
+                            bitstream.byte_offset,
+                            (unsigned int)bitstream.bit_offset);
+                    result = udl_sink_huffman_read_diff_traced(&bitstream, &diff);
+                } else {
+                    result = udl_sink_read_diff_for_writecomp(sink,
+                                                              &bitstream,
+                                                              &device_state,
+                                                              &diff);
+                }
                 if (result != UDL_SINK_OK) {
+                    udl_sink_record_writecomp_error(sink,
+                                                    command[1],
+                                                    produced,
+                                                    &bitstream,
+                                                    device_state,
+                                                    result);
                     if (consumed) {
                         *consumed = 6u + udl_sink_huffman_bytes_consumed(&bitstream);
                     }
@@ -2720,6 +3837,19 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
                 pixel = (uint8_t)((uint32_t)previous_pixel + (uint32_t)(uint8_t)diff);
             } else {
                 pixel = previous_pixel;
+            }
+
+            if (trace_visible_pixel) {
+                fprintf(stderr,
+                        "writecomp pixel trace: result cmd=0x%02x visible_pixel=%u diff=%d pixel8=0x%02x end=%zu.%u state=%u\n",
+                        (unsigned int)command[1],
+                        (unsigned int)trace_visible_index,
+                        (int)(change != 0u ? diff : 0),
+                        (unsigned int)pixel,
+                        bitstream.byte_offset,
+                        (unsigned int)bitstream.bit_offset,
+                        (unsigned int)device_state);
+                udl_sink_writecomp_trace_visible_pixel_hit = true;
             }
 
             decoded8[produced] = pixel;
@@ -2755,8 +3885,10 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
                 continue;
             }
 
-            probe_result = udl_transport_probe_command_candidate(command + pos,
-                                                                  remaining - pos);
+            probe_result = udl_transport_probe_command_candidate(sink,
+                                                                 command + pos,
+                                                                 remaining - pos,
+                                                                 false);
             if (probe_result == UDL_STREAM_PARSE_COMPLETE) {
                 *consumed = pos;
                 break;
@@ -2771,6 +3903,47 @@ static enum udl_sink_result udl_sink_decode_writecomp(struct udl_sink *sink,
                 (unsigned int)pixel_count,
                 *consumed,
                 udl_sink_huffman_bytes_consumed(&bitstream));
+    }
+
+    if (sink &&
+        !use_zerokvm_live_table &&
+        udl_sink_writecomp_live_table_decode_enabled &&
+        udl_sink_writecomp_live_table_state_carry_enabled &&
+        udl_sink_has_nonstatic_device_table(sink)) {
+        if (udl_sink_writecomp_live_table_state_global_enabled) {
+            sink->writecomp_live_state_global = device_state;
+            sink->writecomp_live_state_valid_global = true;
+        } else {
+            if (plane == UDL_SINK_PLANE_16) {
+                sink->writecomp_live_state16 = device_state;
+                sink->writecomp_live_state_valid16 = true;
+            } else {
+                sink->writecomp_live_state8 = device_state;
+                sink->writecomp_live_state_valid8 = true;
+            }
+        }
+    }
+
+    if (sink &&
+        !use_zerokvm_live_table &&
+        udl_sink_writecomp_live_table_decode_enabled &&
+        udl_sink_writecomp_live_table_pixel_carry_enabled &&
+        udl_sink_has_nonstatic_device_table(sink) &&
+        pixel_count > 0u) {
+        if (udl_sink_writecomp_live_table_state_global_enabled) {
+            if (plane == UDL_SINK_PLANE_16) {
+                sink->writecomp_live_pixel_global = decoded16[pixel_count - 1u];
+            } else {
+                sink->writecomp_live_pixel_global = decoded8[pixel_count - 1u];
+            }
+            sink->writecomp_live_pixel_valid_global = true;
+        } else if (plane == UDL_SINK_PLANE_16) {
+            sink->writecomp_live_pixel16 = decoded16[pixel_count - 1u];
+            sink->writecomp_live_pixel_valid16 = true;
+        } else {
+            sink->writecomp_live_pixel8 = decoded8[pixel_count - 1u];
+            sink->writecomp_live_pixel_valid8 = true;
+        }
     }
 
     return UDL_SINK_OK;
@@ -3074,11 +4247,27 @@ static enum udl_sink_result udl_sink_decode_command(struct udl_sink *sink,
 
     switch (command[1]) {
     case UDL_CMD_OPAQUE_E0:
-        (void)sink;
         (void)damage;
         *consumed = udl_transport_e0_command_length(command, remaining);
         if (*consumed == 0u) {
             return UDL_SINK_ERR_TRUNCATED_COMMAND;
+        }
+        if (sink && *consumed >= UDL_CMD_E0_TOTAL_SIZE) {
+            if (udl_sink_writecomp_debug_enabled) {
+                fprintf(stderr,
+                        "AF E0 header: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        (unsigned int)command[0],
+                        (unsigned int)command[1],
+                        (unsigned int)command[2],
+                        (unsigned int)command[3],
+                        (unsigned int)command[4],
+                        (unsigned int)command[5],
+                        (unsigned int)command[6],
+                        (unsigned int)command[7],
+                        (unsigned int)command[8],
+                        (unsigned int)command[9]);
+            }
+            udl_sink_load_device_table(sink, &command[UDL_CMD_E0_HEADER_SIZE]);
         }
         return UDL_SINK_OK;
     case UDL_CMD_NOP_A0:
@@ -3222,6 +4411,98 @@ void udl_transport_set_writecomp_debug(bool enabled)
     udl_sink_writecomp_debug_enabled = enabled;
 }
 
+void udl_transport_set_writecomp_live_table_decode(bool enabled)
+{
+    udl_sink_writecomp_live_table_decode_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_zerokvm(bool enabled)
+{
+    udl_sink_writecomp_live_table_zerokvm_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_state_carry(bool enabled)
+{
+    udl_sink_writecomp_live_table_state_carry_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_state_global(bool enabled)
+{
+    udl_sink_writecomp_live_table_state_global_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_pixel_carry(bool enabled)
+{
+    udl_sink_writecomp_live_table_pixel_carry_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_diff_low16(bool enabled)
+{
+    udl_sink_writecomp_live_table_diff_low16_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_reference_leaf(bool enabled)
+{
+    udl_sink_writecomp_live_table_reference_leaf_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_no_change_bit(bool enabled)
+{
+    udl_sink_writecomp_live_table_no_change_bit_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_live_table_state_seed(bool enabled, uint16_t seed)
+{
+    udl_sink_writecomp_live_table_state_seed_enabled = enabled;
+    udl_sink_writecomp_live_table_state_seed = (uint16_t)(seed & 0x1ffu);
+}
+
+void udl_transport_set_writecomp_live_table_state_seed16(bool enabled, uint16_t seed)
+{
+    udl_sink_writecomp_live_table_state_seed16_enabled = enabled;
+    udl_sink_writecomp_live_table_state_seed16 = (uint16_t)(seed & 0x1ffu);
+}
+
+void udl_transport_set_writecomp_live_table_state_seed8(bool enabled, uint16_t seed)
+{
+    udl_sink_writecomp_live_table_state_seed8_enabled = enabled;
+    udl_sink_writecomp_live_table_state_seed8 = (uint16_t)(seed & 0x1ffu);
+}
+
+void udl_transport_set_writecomp_hybrid_static_live(bool enabled)
+{
+    udl_sink_writecomp_hybrid_static_live_enabled = enabled;
+}
+
+void udl_transport_set_writecomp_trace_target(bool enabled,
+                                              uint8_t command_type,
+                                              uint32_t pixel_index,
+                                              size_t byte_offset,
+                                              uint8_t bit_offset)
+{
+    udl_sink_writecomp_trace_target_enabled = enabled;
+    udl_sink_writecomp_trace_target_hit = false;
+    udl_sink_writecomp_trace_target_command = command_type;
+    udl_sink_writecomp_trace_target_pixel = pixel_index;
+    udl_sink_writecomp_trace_target_byte = byte_offset;
+    udl_sink_writecomp_trace_target_bit = bit_offset;
+}
+
+void udl_transport_set_writecomp_trace_visible_pixel(bool enabled,
+                                                     uint32_t visible_pixel_index)
+{
+    udl_sink_writecomp_trace_visible_pixel_enabled = enabled;
+    udl_sink_writecomp_trace_visible_pixel_hit = false;
+    udl_sink_writecomp_trace_visible_pixel = visible_pixel_index;
+}
+
+void udl_transport_set_writecomp_trace_first_failure(bool enabled)
+{
+    udl_sink_writecomp_trace_first_failure_enabled = enabled;
+    udl_sink_writecomp_trace_first_failure_hit = false;
+    udl_sink_writecomp_trace_first_failure_probe_done = false;
+}
+
 void udl_transport_reset(struct udl_transport *transport)
 {
     if (!transport) {
@@ -3229,6 +4510,28 @@ void udl_transport_reset(struct udl_transport *transport)
     }
 
     transport->pending_len = 0u;
+    transport->last_feed_first_error_valid = false;
+    transport->last_feed_first_error_writecomp_valid = false;
+    transport->last_feed_first_error_command_type = 0u;
+    transport->last_feed_first_error_writecomp_command = 0u;
+    transport->last_feed_first_error_sink_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_writecomp_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_writecomp_live_probe_valid = false;
+    transport->last_feed_first_error_writecomp_static_probe_valid = false;
+    transport->last_feed_first_error_writecomp_static_probe_matches_decoder = false;
+    transport->last_feed_first_error_writecomp_live_probe_successes = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_consumed = 0u;
+    transport->last_feed_first_error_writecomp_pixel_index = 0u;
+    transport->last_feed_first_error_writecomp_byte_offset = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_end_byte_offset = 0u;
+    transport->last_feed_first_error_writecomp_bit_offset = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_end_bit_offset = 0u;
+    transport->last_feed_first_error_writecomp_state = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_invalid_node = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_invalid_bit = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_invalid_next = UINT32_MAX;
+    transport->last_feed_first_error_stage = UDL_TRANSPORT_ERROR_NONE;
     transport->writecomp_quarantine_active = false;
     transport->writecomp_quarantine_noncomp_ok = 0u;
     transport->writecomp_quarantine_budget = 0u;
@@ -3245,6 +4548,28 @@ void udl_transport_destroy(struct udl_transport *transport)
     transport->pending = NULL;
     transport->pending_len = 0u;
     transport->pending_capacity = 0u;
+    transport->last_feed_first_error_valid = false;
+    transport->last_feed_first_error_writecomp_valid = false;
+    transport->last_feed_first_error_command_type = 0u;
+    transport->last_feed_first_error_writecomp_command = 0u;
+    transport->last_feed_first_error_sink_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_writecomp_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_writecomp_live_probe_valid = false;
+    transport->last_feed_first_error_writecomp_static_probe_valid = false;
+    transport->last_feed_first_error_writecomp_static_probe_matches_decoder = false;
+    transport->last_feed_first_error_writecomp_live_probe_successes = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_consumed = 0u;
+    transport->last_feed_first_error_writecomp_pixel_index = 0u;
+    transport->last_feed_first_error_writecomp_byte_offset = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_end_byte_offset = 0u;
+    transport->last_feed_first_error_writecomp_bit_offset = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_end_bit_offset = 0u;
+    transport->last_feed_first_error_writecomp_state = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_invalid_node = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_invalid_bit = 0u;
+    transport->last_feed_first_error_writecomp_static_probe_invalid_next = UINT32_MAX;
+    transport->last_feed_first_error_stage = UDL_TRANSPORT_ERROR_NONE;
     transport->writecomp_quarantine_active = false;
     transport->writecomp_quarantine_noncomp_ok = 0u;
     transport->writecomp_quarantine_budget = 0u;
@@ -3286,6 +4611,20 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
     transport->last_feed_first_resync_offset = 0u;
     transport->last_feed_first_resync_offset_valid = false;
     transport->last_feed_first_resync_reason = UDL_TRANSPORT_RESYNC_NONE;
+    transport->last_feed_first_error_valid = false;
+    transport->last_feed_first_error_writecomp_valid = false;
+    transport->last_feed_first_error_command_type = 0u;
+    transport->last_feed_first_error_writecomp_command = 0u;
+    transport->last_feed_first_error_sink_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_writecomp_result = (int)UDL_SINK_OK;
+    transport->last_feed_first_error_writecomp_live_probe_valid = false;
+    transport->last_feed_first_error_writecomp_live_probe_successes = 0u;
+    transport->last_feed_first_error_consumed = 0u;
+    transport->last_feed_first_error_writecomp_pixel_index = 0u;
+    transport->last_feed_first_error_writecomp_byte_offset = 0u;
+    transport->last_feed_first_error_writecomp_bit_offset = 0u;
+    transport->last_feed_first_error_writecomp_state = 0u;
+    transport->last_feed_first_error_stage = UDL_TRANSPORT_ERROR_NONE;
 
     if (transport->sink->width == 0u || transport->sink->height == 0u) {
         return UDL_TRANSPORT_ERR_INVALID_ARGUMENT;
@@ -3333,7 +4672,8 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                          pending_len,
                                                          &sync_offset,
                                                          &needs_more) &&
-                !udl_transport_find_next_command(pending,
+                !udl_transport_find_next_command(transport->sink,
+                                                 pending,
                                                  pending_len,
                                                  &sync_offset,
                                                  &needs_more)) {
@@ -3353,6 +4693,11 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                   pending_prefix_len,
                                                   offset,
                                                   UDL_TRANSPORT_RESYNC_NON_BULK);
+                udl_transport_record_first_error(transport,
+                                                 UDL_TRANSPORT_ERROR_NON_BULK,
+                                                 0u,
+                                                 UDL_SINK_ERR_INVALID_COMMAND,
+                                                 0u);
                 stats_delta.dropped_bytes += pending_len;
                 offset = transport->pending_len;
                 break;
@@ -3382,6 +4727,11 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                               pending_prefix_len,
                                               offset,
                                               UDL_TRANSPORT_RESYNC_DOUBLE_BULK);
+            udl_transport_record_first_error(transport,
+                                             UDL_TRANSPORT_ERROR_DOUBLE_BULK,
+                                             0u,
+                                             UDL_SINK_ERR_INVALID_COMMAND,
+                                             0u);
             offset += 1u;
             continue;
         }
@@ -3432,10 +4782,16 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                   pending_prefix_len,
                                                   offset,
                                                   UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
+                udl_transport_record_first_error(transport,
+                                                 UDL_TRANSPORT_ERROR_WRITERLX16_PARSE,
+                                                 command_type,
+                                                 UDL_SINK_ERR_INVALID_COMMAND,
+                                                 0u);
                 stats_delta.decode_errors += 1u;
 
                 if (pending_len > 1u &&
-                    udl_transport_find_next_framebuffer_command_strict(pending + 1u,
+                    udl_transport_find_next_framebuffer_command_strict(transport->sink,
+                                                                       pending + 1u,
                                                                        pending_len - 1u,
                                                                        &sync_offset,
                                                                        &needs_more)) {
@@ -3473,7 +4829,10 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                 udl_transport_record_command_type(&stats_delta, command_type);
             }
 
-            probe_result = udl_transport_probe_writecomp_candidate(pending, pending_len);
+            probe_result = udl_transport_probe_writecomp_candidate(transport->sink,
+                                                                   pending,
+                                                                   pending_len,
+                                                                   true);
             if (probe_result == UDL_STREAM_PARSE_NEED_MORE) {
                 break;
             }
@@ -3487,6 +4846,11 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                   pending_prefix_len,
                                                   offset,
                                                   UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
+                udl_transport_record_first_error(transport,
+                                                 UDL_TRANSPORT_ERROR_WRITECOMP_PROBE,
+                                                 command_type,
+                                                 UDL_SINK_ERR_INVALID_COMMAND,
+                                                 0u);
                 stats_delta.decode_errors += 1u;
                 udl_transport_begin_writecomp_quarantine(transport);
 
@@ -3498,13 +4862,15 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                             &needs_more)) {
                     skipped = 1u + sync_offset;
                 } else if (pending_len > 1u &&
-                           udl_transport_find_next_framebuffer_command_strict(pending + 1u,
+                           udl_transport_find_next_framebuffer_command_strict(transport->sink,
+                                                                              pending + 1u,
                                                                               pending_len - 1u,
                                                                               &sync_offset,
                                                                               &needs_more)) {
                     skipped = 1u + sync_offset;
                 } else if (pending_len > 1u &&
-                           udl_transport_find_next_command_strict(pending + 1u,
+                           udl_transport_find_next_command_strict(transport->sink,
+                                                                  pending + 1u,
                                                                   pending_len - 1u,
                                                                   &sync_offset,
                                                                   &strict_needs_more)) {
@@ -3550,6 +4916,11 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                   pending_prefix_len,
                                                   offset,
                                                   UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
+                udl_transport_record_first_error(transport,
+                                                 UDL_TRANSPORT_ERROR_WRITECOMP_DECODE,
+                                                 command_type,
+                                                 decode_result,
+                                                 consumed);
                 stats_delta.decode_errors += 1u;
                 udl_transport_begin_writecomp_quarantine(transport);
 
@@ -3580,13 +4951,15 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                             &needs_more)) {
                     skipped = scan_start + sync_offset;
                 } else if (pending_len > scan_start &&
-                           udl_transport_find_next_framebuffer_command_strict(pending + scan_start,
+                           udl_transport_find_next_framebuffer_command_strict(transport->sink,
+                                                                              pending + scan_start,
                                                                               pending_len - scan_start,
                                                                               &sync_offset,
                                                                               &needs_more)) {
                     skipped = scan_start + sync_offset;
                 } else if (pending_len > scan_start &&
-                           udl_transport_find_next_command_strict(pending + scan_start,
+                           udl_transport_find_next_command_strict(transport->sink,
+                                                                  pending + scan_start,
                                                                   pending_len - scan_start,
                                                                   &sync_offset,
                                                                   &strict_needs_more)) {
@@ -3634,6 +5007,11 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                               pending_prefix_len,
                                               offset,
                                               UDL_TRANSPORT_RESYNC_INVALID_COMMAND);
+            udl_transport_record_first_error(transport,
+                                             UDL_TRANSPORT_ERROR_COMMAND_PARSE,
+                                             command_type,
+                                             UDL_SINK_ERR_INVALID_COMMAND,
+                                             0u);
             stats_delta.decode_errors += 1u;
 
             if (pending_len > 1u &&
@@ -3644,7 +5022,8 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                         &needs_more)) {
                 skipped = 1u + sync_offset;
             } else if (pending_len > 1u &&
-                       udl_transport_find_next_command(pending + 1u,
+                       udl_transport_find_next_command(transport->sink,
+                                                       pending + 1u,
                                                        pending_len - 1u,
                                                        &sync_offset,
                                                        &needs_more)) {
@@ -3683,11 +5062,21 @@ enum udl_transport_result udl_transport_feed(struct udl_transport *transport,
                                                 &consumed,
                                                 &command_damage);
         if (decode_result != UDL_SINK_OK) {
+            udl_transport_record_first_error(transport,
+                                             UDL_TRANSPORT_ERROR_COMMAND_DECODE,
+                                             command_type,
+                                             decode_result,
+                                             consumed);
             stats_delta.decode_errors += 1u;
             offset += command_len;
             continue;
         }
         if (consumed != command_len) {
+            udl_transport_record_first_error(transport,
+                                             UDL_TRANSPORT_ERROR_COMMAND_CONSUMED_MISMATCH,
+                                             command_type,
+                                             UDL_SINK_OK,
+                                             consumed);
             stats_delta.decode_errors += 1u;
             offset += command_len;
             continue;

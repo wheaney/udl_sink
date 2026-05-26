@@ -7,6 +7,7 @@
 
 enum {
     TEST_UDL_MSG_BULK = 0xafu,
+    TEST_UDL_CMD_OPAQUE_E0 = 0xe0u,
     TEST_UDL_CMD_WRITERAW8 = 0x60u,
     TEST_UDL_CMD_WRITERL8 = 0x61u,
     TEST_UDL_CMD_WRITECOPY8 = 0x62u,
@@ -17,7 +18,18 @@ enum {
     TEST_UDL_CMD_WRITECOMP8 = 0x70u,
     TEST_UDL_CMD_WRITECOMP16 = 0x78u,
     TEST_UDL_MAX_COMMAND_PIXELS = 256u,
+    TEST_UDL_CMD_E0_RECORD_SIZE = 9u,
+    TEST_UDL_CMD_E0_RECORD_COUNT = 512u,
+    TEST_UDL_CMD_E0_TOTAL_SIZE = 10u + (TEST_UDL_CMD_E0_RECORD_SIZE * TEST_UDL_CMD_E0_RECORD_COUNT),
 };
+
+static void write_be32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value >> 24);
+    dst[1] = (uint8_t)(value >> 16);
+    dst[2] = (uint8_t)(value >> 8);
+    dst[3] = (uint8_t)value;
+}
 
 static uint8_t encode_count_byte(uint32_t count)
 {
@@ -238,6 +250,35 @@ static size_t encode_reference_surface(const uint16_t *pixels,
     return total_bytes;
 }
 
+static void encode_device_table_record(uint8_t *table,
+                                       uint16_t record_index,
+                                       uint32_t left_value,
+                                       uint8_t left_meta,
+                                       uint32_t right_value,
+                                       uint8_t right_meta)
+{
+    uint8_t *record = table + ((size_t)record_index * TEST_UDL_CMD_E0_RECORD_SIZE);
+
+    write_be32(&record[0], left_value);
+    record[4] = (uint8_t)(((left_meta & 0x0fu) << 4) | (right_meta & 0x0fu));
+    write_be32(&record[5], right_value);
+}
+
+static void encode_device_table_command(uint8_t *command)
+{
+    memset(command, 0, TEST_UDL_CMD_E0_TOTAL_SIZE);
+    command[0] = TEST_UDL_MSG_BULK;
+    command[1] = TEST_UDL_CMD_OPAQUE_E0;
+    command[2] = 0x26u;
+    command[3] = 0x38u;
+    command[4] = 0x71u;
+    command[5] = 0xcdu;
+    command[6] = 0x00u;
+    command[7] = 0x00u;
+    command[8] = 0x02u;
+    command[9] = 0x00u;
+}
+
 static void test_writerlx16_decodes_damage(void)
 {
     uint16_t framebuffer[8] = {0};
@@ -415,6 +456,110 @@ static void test_invalid_command_returns_error(void)
     udl_sink_init(&sink, framebuffer, 2u, 2u, 2u);
 
     assert(udl_sink_decode_buffer(&sink, packet, sizeof(packet), NULL) == UDL_SINK_ERR_INVALID_COMMAND);
+    udl_sink_destroy(&sink);
+}
+
+static void test_device_table_branch_unpack(void)
+{
+    uint16_t framebuffer[1] = {0};
+    uint8_t command[TEST_UDL_CMD_E0_TOTAL_SIZE];
+    uint8_t *table = &command[10];
+    struct udl_sink sink;
+    struct udl_sink_device_table_branch branch;
+
+    encode_device_table_command(command);
+    encode_device_table_record(table, 0u, 0x00000100u, 0u, 0x00000001u, 0u);
+    encode_device_table_record(table, 1u, 0x00000160u, 0u, 0x00000061u, 1u);
+    encode_device_table_record(table, 6u, 0xffffff7fu, 15u, 0xffffff7fu, 15u);
+    encode_device_table_record(table, 98u, 0x08010100u, 0u, 0x10020007u, 9u);
+    encode_device_table_record(table, 352u, 0x20040012u, 5u, 0x40080012u, 5u);
+
+    udl_sink_init(&sink, framebuffer, 1u, 1u, 1u);
+
+    assert(udl_sink_decode_buffer(&sink, command, sizeof(command), NULL) == UDL_SINK_OK);
+    assert(sink.huffman_device_table_loaded);
+
+    assert(udl_sink_get_device_table_branch(&sink, 0u, false, &branch));
+    assert(branch.is_reference);
+    assert(branch.reference_state == 256u);
+    assert(branch.meta_bits == 0u);
+
+    assert(udl_sink_get_device_table_branch(&sink, 1u, true, &branch));
+    assert(branch.is_reference);
+    assert(branch.reference_state == 97u);
+    assert(branch.meta_bits == 1u);
+
+    assert(udl_sink_get_device_table_branch(&sink, 6u, false, &branch));
+    assert(!branch.is_reference);
+    assert(branch.diff16 == -1);
+    assert(branch.continuation_state == 383u);
+    assert(branch.aux_bits == 127u);
+    assert(branch.meta_bits == 15u);
+
+    assert(udl_sink_get_device_table_branch(&sink, 98u, true, &branch));
+    assert(!branch.is_reference);
+    assert(branch.diff16 == 4098);
+    assert(branch.continuation_state == 7u);
+    assert(branch.aux_bits == 0u);
+    assert(branch.meta_bits == 9u);
+
+    assert(udl_sink_get_device_table_branch(&sink, 352u, false, &branch));
+    assert(!branch.is_reference);
+    assert(branch.diff16 == 8196);
+    assert(branch.continuation_state == 18u);
+    assert(branch.aux_bits == 0u);
+    assert(branch.meta_bits == 5u);
+
+    assert(!udl_sink_get_device_table_branch(&sink, TEST_UDL_CMD_E0_RECORD_COUNT, false, &branch));
+
+    udl_sink_destroy(&sink);
+}
+
+static void test_device_table_cursor_decodes_synthetic_stream(void)
+{
+    uint16_t framebuffer[1] = {0};
+    uint8_t command[TEST_UDL_CMD_E0_TOTAL_SIZE] = {0};
+    uint8_t diff_bits[1] = {0};
+    uint8_t *table = &command[10];
+    struct udl_sink sink;
+    uint16_t state = 0u;
+    size_t bit_offset = 0u;
+    int16_t diff = 0;
+
+    encode_device_table_command(command);
+    encode_device_table_record(table, 0u, 0x00000001u, 0u, 0x00000002u, 0u);
+    encode_device_table_record(table, 1u, 0x00010001u, 0u, 0xffff0002u, 0u);
+    encode_device_table_record(table, 2u, 0x00020001u, 0u, 0x00030002u, 0u);
+
+    udl_sink_init(&sink, framebuffer, 1u, 1u, 1u);
+    assert(udl_sink_decode_buffer(&sink, command, sizeof(command), NULL) == UDL_SINK_OK);
+
+    diff_bits[0] = 0x08u; /* LSB-first bitstream: 00, 0, 1 */
+
+    assert(udl_sink_decode_device_table_diff(&sink, &state, diff_bits, 4u, &bit_offset, &diff) == UDL_SINK_OK);
+    assert(diff == 1);
+    assert(state == 1u);
+    assert(bit_offset == 2u);
+
+    assert(udl_sink_decode_device_table_diff(&sink, &state, diff_bits, 4u, &bit_offset, &diff) == UDL_SINK_OK);
+    assert(diff == 1);
+    assert(state == 1u);
+    assert(bit_offset == 3u);
+
+    assert(udl_sink_decode_device_table_diff(&sink, &state, diff_bits, 4u, &bit_offset, &diff) == UDL_SINK_OK);
+    assert(diff == -1);
+    assert(state == 2u);
+    assert(bit_offset == 4u);
+
+    state = 0u;
+    bit_offset = 0u;
+    diff_bits[0] = 0x01u; /* LSB-first bitstream: 10 */
+
+    assert(udl_sink_decode_device_table_diff(&sink, &state, diff_bits, 2u, &bit_offset, &diff) == UDL_SINK_OK);
+    assert(diff == 2);
+    assert(state == 1u);
+    assert(bit_offset == 2u);
+
     udl_sink_destroy(&sink);
 }
 
@@ -933,6 +1078,8 @@ int main(void)
     test_writerlx16_raw_noop();
     test_writereg_and_writecopy16_track_state();
     test_invalid_command_returns_error();
+    test_device_table_branch_unpack();
+    test_device_table_cursor_decodes_synthetic_stream();
     test_transport_reassembles_split_writecomp16();
     test_reference_roundtrip_rgb565_surface();
     test_reference_roundtrip_repeat_only_rgb565_surface();
